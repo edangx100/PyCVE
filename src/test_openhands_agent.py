@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Minimal OpenHands SDK test script (Task 2).
-Creates a single agent that executes a simple terminal command.
+Minimal OpenHands SDK test script (Tasks 2-3).
+Creates a single agent that executes a simple terminal command and delegates
+one task to a sub-agent via DelegateTool.
 """
 
 import os
@@ -27,6 +28,12 @@ os.environ["OR_APP_NAME"] = "PyCVE OpenHands Test"
 
 # NOW import OpenHands SDK after environment is configured
 from openhands.sdk import LLM, Agent, Conversation, Tool
+from openhands.sdk.conversation.response_utils import get_agent_final_response
+from openhands.sdk.event import ObservationEvent
+from openhands.tools.delegate import DelegateTool
+from openhands.tools.delegate.registration import register_agent
+from openhands.tools.file_editor import FileEditorTool
+from openhands.tools.task_tracker import TaskTrackerTool
 from openhands.tools.terminal import TerminalTool
 
 
@@ -46,11 +53,34 @@ def main():
         api_key=api_key,
     )
 
-    # Create agent with TerminalTool
+    def create_subprocess_agent(agent_llm):
+        return Agent(
+            llm=agent_llm,
+            tools=[
+                Tool(
+                    name=TerminalTool.name,
+                    params={"terminal_type": "subprocess"},
+                ),
+            ],
+        )
+
+    register_agent(
+        name="subprocess",
+        factory_func=create_subprocess_agent,
+        description="Agent that uses subprocess terminal to avoid tmux",
+    )
+
+    # Create agent with TerminalTool and DelegateTool
     agent = Agent(
         llm=llm,
         tools=[
-            Tool(name=TerminalTool.name),
+            Tool(
+                name=TerminalTool.name,
+                params={"terminal_type": "subprocess"},
+            ),
+            Tool(name=DelegateTool.name),
+            Tool(name=FileEditorTool.name),
+            Tool(name=TaskTrackerTool.name),
         ],
     )
 
@@ -59,7 +89,19 @@ def main():
     conversation = Conversation(agent=agent, workspace=cwd)
 
     # Send task to agent
-    task = 'Execute the command: echo "Hello from OpenHands agent!"'
+    test_file_path = os.path.join(cwd, "artifacts", "task3_file_editor_test.txt")
+    task = (
+        "First, run: echo \"Hello from OpenHands agent!\" using TerminalTool. "
+        "Next, use FileEditorTool to create a file at "
+        f"{test_file_path} with the exact content: \"FileEditorTool OK\". "
+        "Then use TaskTrackerTool to view the current list, and plan a new list "
+        "with a single task titled \"Verify built-in tools\" marked as done, "
+        "with notes \"Task 3 built-in tools check\". "
+        "Then use DelegateTool to spawn a sub-agent with id 'helper' using agent "
+        "type 'subprocess', then delegate a task to run: "
+        "echo \"Hello from OpenHands sub-agent!\" using TerminalTool. "
+        "Return the sub-agent's output and a short tool summary."
+    )
     print(f"\nTask: {task}\n")
     print("Agent output:")
     print("-" * 60)
@@ -67,6 +109,35 @@ def main():
     try:
         conversation.send_message(task)
         conversation.run()
+        final_response = get_agent_final_response(conversation.state.events)
+        if final_response:
+            print("\nAgent final response:")
+            print(final_response)
+
+        tool_map = {
+            "TerminalTool": TerminalTool.name,
+            "DelegateTool": DelegateTool.name,
+            "FileEditorTool": FileEditorTool.name,
+            "TaskTrackerTool": TaskTrackerTool.name,
+        }
+        tool_results = {name: {"used": False, "error": False} for name in tool_map}
+        for event in conversation.state.events:
+            if isinstance(event, ObservationEvent):
+                for display_name, tool_name in tool_map.items():
+                    if event.tool_name == tool_name:
+                        tool_results[display_name]["used"] = True
+                        if event.observation.is_error:
+                            tool_results[display_name]["error"] = True
+
+        print("\nBuilt-in tools summary:")
+        for display_name, result in tool_results.items():
+            if not result["used"]:
+                status = "NOT USED"
+            elif result["error"]:
+                status = "ERROR"
+            else:
+                status = "OK"
+            print(f"- {display_name}: {status}")
         print("-" * 60)
         print("\n✓ Agent executed successfully!")
 

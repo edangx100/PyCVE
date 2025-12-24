@@ -25,11 +25,11 @@ Each task below delivers a small, testable increment that you can interact with 
 ---
 
 ### ✅ Task 3: Built-in Tools Verification
-- [ ] Extend the test agent to use DelegateTool (delegate to a sub-agent)
-- [ ] Use FileEditorTool to create/edit a test file
-- [ ] Use TaskTrackerTool to log a task
-- [ ] Print summary of which built-in tools work
-- [ ] **test**: Confirm all 4 required built-in tools are functional
+- [x] Extend the test agent to use DelegateTool (delegate to a sub-agent)
+- [x] Use FileEditorTool to create/edit a test file
+- [x] Use TaskTrackerTool to log a task
+- [x] Print summary of which built-in tools work
+- [x] **test**: Confirm all 4 required built-in tools are functional
 
 ---
 
