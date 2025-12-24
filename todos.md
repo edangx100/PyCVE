@@ -16,11 +16,11 @@ Each task below delivers a small, testable increment that you can interact with 
 ---
 
 ### ✅ Task 2: OpenHands SDK "Hello World"
-- [ ] Create a minimal single-agent script using OpenHands SDK
-- [ ] Configure OpenRouter LLM for the agent
-- [ ] Agent executes a simple command (e.g., `echo "Hello from OpenHands"`) via TerminalTool
-- [ ] Print the agent's output to console
-- [ ] **test**: Run script and see the agent successfully execute a terminal command
+- [x] Create a minimal single-agent script using OpenHands SDK
+- [x] Configure OpenRouter LLM for the agent
+- [x] Agent executes a simple command (e.g., `echo "Hello from OpenHands"`) via TerminalTool
+- [x] Print the agent's output to console
+- [x] **test**: Run script and see the agent successfully execute a terminal command
 
 ---
 
