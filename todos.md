@@ -7,11 +7,11 @@ Each task below delivers a small, testable increment that you can interact with 
 ## Phase 1: Foundation & Validation
 
 ### ✅ Task 1: Project Setup & Environment Validation
-- [ ] Create `.env` file with required variables (`OPENROUTER_API_KEY`, model configs)
-- [ ] Create `requirements.txt` with initial dependencies (openhands-sdk, gradio, python-dotenv)
-- [ ] Create basic project structure (`src/`, `artifacts/`, `tests/`)
-- [ ] Write a minimal script that validates OpenRouter API connectivity
-- [ ] **test**: Run the script and confirm you see a successful API response
+- [x] Create `.env` file with required variables (`OPENROUTER_API_KEY`, model configs)
+- [x] Create `requirements.txt` with initial dependencies (openhands-sdk, gradio, python-dotenv)
+- [x] Create basic project structure (`src/`, `artifacts/`, `tests/`)
+- [x] Write a minimal script that validates OpenRouter API connectivity
+- [x] **test**: Run the script and confirm you see a successful API response
 
 ---
 
