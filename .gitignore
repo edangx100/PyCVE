@@ -26,6 +26,7 @@ dist/
 
 # App artifacts
 artifacts/
+workspace/
 
 # OS / editor
 .DS_Store

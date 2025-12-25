@@ -45,12 +45,13 @@ Each task below delivers a small, testable increment that you can interact with 
 
 ---
 
-### ✅ Task 5: Clone Repo (Local Workspace)
-- [ ] Create Coordinator agent that accepts GitHub URL
-- [ ] Agent clones repo to `workspace/<run_id>/repo/` (local filesystem for now)
-- [ ] Stream clone progress to Gradio UI
-- [ ] Display success/failure message with repo path
-- [ ] **test**: Enter a real GitHub URL, see repo cloned locally, verify files exist
+### ✅ Task 5: Coordinator Clone Repo (Local Workspace)
+- [x] Create a new folder `src/agents`
+- [x] Create Coordinator agent within `src/agents` that accepts GitHub URL. Agent is based on OpenHands software agent SDK: https://docs.openhands.dev/sdk/getting-started
+- [x] Agent clones repo to `workspace/<run_id>/repo/` (local filesystem for now)
+- [x] Stream clone progress to Gradio UI
+- [x] Display success/failure message with repo path
+- [x] **test**: Enter a real GitHub URL, see repo cloned locally, verify files exist
 
 ---
 
