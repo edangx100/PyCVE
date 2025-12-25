@@ -56,11 +56,11 @@ Each task below delivers a small, testable increment that you can interact with 
 ---
 
 ### ✅ Task 6: Requirements.txt Detection & Parsing
-- [ ] Coordinator checks if `requirements.txt` exists in cloned repo
-- [ ] Implement conservative parsing logic (editable vs directive classification)
-- [ ] Implement directive gating (SKIP if directives found)
-- [ ] Display parse results in UI (editable packages, directives found, skip reason)
-- [ ] **test**: Test with 2 repos: one simple requirements.txt, one with directives; verify correct behavior
+- [x] Coordinator checks if `requirements.txt` exists in cloned repo
+- [x] Implement conservative parsing logic (editable vs directive classification)
+- [x] Implement directive gating (SKIP if directives found)
+- [x] Display parse results in UI (editable packages, directives found, skip reason)
+- [x] **test**: Test with 2 repos: one simple requirements.txt, one with directives; verify correct behavior
 
 ---
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import os
+import re
 import shlex
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Generator, Optional
 
 from dotenv import load_dotenv
@@ -39,7 +41,7 @@ class Coordinator:
         workspace_root: str,
         run_id: Optional[str] = None,
     ) -> Generator[str, None, None]:
-        # Stream a git clone to the caller while it runs in OpenHands.
+        # Stream a git clone (and follow-on parse) while the agent runs in OpenHands.
         if not repo_url or not repo_url.strip():
             yield "[clone] FAILED: repo URL is required."
             return
@@ -111,6 +113,36 @@ class Coordinator:
             yield f"[clone] SUCCESS: {repo_dir}"
         else:
             yield "[clone] FAILED: repo directory not found after clone."
+            return
+
+        # Parse requirements.txt and gate on directives before later stages.
+        requirements_path = os.path.join(repo_dir, "requirements.txt")
+        if not os.path.isfile(requirements_path):
+            yield f"[parse] SKIPPED: requirements.txt not found at {requirements_path}"
+            return
+
+        yield f"[parse] Found requirements.txt at {requirements_path}"
+        parse_result = self.parse_requirements_file(requirements_path)
+        if parse_result.editable:
+            yield f"[parse] Editable requirements: {len(parse_result.editable)}"
+            for entry in parse_result.editable:
+                spec = f" {entry.spec}" if entry.spec else ""
+                yield f"[parse][editable] L{entry.line_no}: {entry.name}{spec}"
+        else:
+            yield "[parse] Editable requirements: 0"
+
+        if parse_result.unknown:
+            yield f"[parse] Unsupported/unknown lines: {len(parse_result.unknown)}"
+            for entry in parse_result.unknown:
+                yield f"[parse][unknown] L{entry.line_no}: {entry.raw}"
+
+        if parse_result.directives:
+            yield f"[parse] Directives found: {len(parse_result.directives)}"
+            for entry in parse_result.directives:
+                yield f"[parse][directive] L{entry.line_no}: {entry.raw}"
+            if parse_result.skip_reason:
+                yield f"[parse] SKIPPED: {parse_result.skip_reason}"
+            return
 
     @staticmethod
     def _new_run_id() -> str:
@@ -175,5 +207,104 @@ class Coordinator:
 
     @staticmethod
     def _split_output(text: str) -> list[str]:
+        # Normalize CRLF and return non-empty output lines.
         cleaned = text.replace("\r", "\n")
         return [line.rstrip("\n") for line in cleaned.splitlines() if line.strip()]
+
+    def parse_requirements_file(self, path: str) -> "RequirementsParseResult":
+        # File wrapper for parse_requirements_text so callers can use a path.
+        with open(path, "r", encoding="utf-8") as handle:
+            return self.parse_requirements_text(handle.read())
+
+    @staticmethod
+    def parse_requirements_text(text: str) -> "RequirementsParseResult":
+        # Conservative parser: editable specs only, directive/unknown are gated.
+        result = RequirementsParseResult()
+        for line_no, raw_line in enumerate(text.splitlines(), start=1):
+            cleaned = Coordinator._strip_inline_comment(raw_line)
+            if not cleaned.strip():
+                continue
+
+            stripped = cleaned.strip()
+            if Coordinator._is_directive(stripped):
+                result.directives.append(DirectiveEntry(line_no=line_no, raw=stripped))
+                continue
+
+            parsed = Coordinator._parse_editable_requirement(stripped, line_no)
+            if parsed:
+                result.editable.append(parsed)
+            else:
+                result.unknown.append(DirectiveEntry(line_no=line_no, raw=stripped))
+
+        if result.directives:
+            result.skip_reason = "directive or unsupported install option detected"
+
+        return result
+
+    @staticmethod
+    def _strip_inline_comment(line: str) -> str:
+        # Remove inline comments while preserving trailing whitespace in specs.
+        if "#" not in line:
+            return line
+        if line.lstrip().startswith("#"):
+            return ""
+        parts = re.split(r"\s+#", line, maxsplit=1)
+        return parts[0].rstrip()
+
+    @staticmethod
+    def _is_directive(line: str) -> bool:
+        # Flag any directive/include/index/URL/path as skip-worthy.
+        lower = line.lower()
+        if lower.startswith("-"):
+            return True
+        if lower.startswith(("git+", "hg+", "svn+", "bzr+")):
+            return True
+        if "://" in line:
+            return True
+        if line.startswith((".", "/", "~")):
+            return True
+        if lower.startswith("file:"):
+            return True
+        if "@" in line:
+            return True
+        return False
+
+    @staticmethod
+    def _parse_editable_requirement(
+        line: str,
+        line_no: int,
+    ) -> Optional["RequirementEntry"]:
+        # Accept only simple name[op]version constraints with comma-separated ops.
+        name_re = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+        op_re = r"(==|>=|<=|~=|!=|>|<)"
+        version_re = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+        spec_re = rf"{op_re}\s*{version_re}"
+        combined_re = rf"^(?P<name>{name_re})(?P<spec>\s*(?:{spec_re})(?:\s*,\s*{spec_re})*)?\s*$"
+        match = re.match(combined_re, line)
+        if not match:
+            return None
+        name = match.group("name")
+        spec = match.group("spec") or ""
+        return RequirementEntry(name=name, spec=spec.strip(), line_no=line_no, raw=line)
+
+
+@dataclass
+class RequirementEntry:
+    name: str
+    spec: str
+    line_no: int
+    raw: str
+
+
+@dataclass
+class DirectiveEntry:
+    line_no: int
+    raw: str
+
+
+@dataclass
+class RequirementsParseResult:
+    editable: list[RequirementEntry] = field(default_factory=list)
+    directives: list[DirectiveEntry] = field(default_factory=list)
+    unknown: list[DirectiveEntry] = field(default_factory=list)
+    skip_reason: Optional[str] = None
