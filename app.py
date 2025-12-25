@@ -20,13 +20,24 @@ def start_scan(repo_url: str):
 
     # Run workspace directory on the host for now.
     workspace_root = os.path.join(os.getcwd(), "workspace")
+    artifacts_root = os.path.join(os.getcwd(), "artifacts")
+    final_status = None
     try:
-        for line in coordinator.clone_repo_stream(repo_url, workspace_root=workspace_root):
+        for line in coordinator.clone_repo_stream(
+            repo_url,
+            workspace_root=workspace_root,
+            artifacts_root=artifacts_root,
+        ):
             log_lines.append(line)
+            if line.startswith("[run] COMPLETE:"):
+                final_status = line
             yield "\n".join(log_lines)
     except Exception as exc:
         log_lines.append(f"[error] {exc}")
         yield "\n".join(log_lines)
+    finally:
+        if final_status:
+            print(final_status)
 
 
 with gr.Blocks(title="PyCVE") as demo:

@@ -67,12 +67,12 @@ Each task below delivers a small, testable increment that you can interact with 
 ## Phase 3: Scanning & Worklist
 
 ### ✅ Task 7: pip-audit Baseline Scan
-- [ ] Create venv in workspace after successful parse
-- [ ] Install pip-audit in venv
-- [ ] Run `pip-audit -r requirements.txt --format json`
-- [ ] Save output to `artifacts/<run_id>/pip_audit_before.json`
-- [ ] Display vulnerability count in UI
-- [ ] **test**: Use a repo with known vulnerabilities (or create test requirements.txt), see JSON artifact generated
+- [x] Create venv in workspace after successful parse
+- [x] Install pip-audit in venv
+- [x] Run `pip-audit -r requirements.txt --format json`
+- [x] Save output to `artifacts/<run_id>/pip_audit_before.json`
+- [x] Display vulnerability count in UI
+- [x] **test**: Use a repo with known vulnerabilities (or create test requirements.txt), see JSON artifact generated
 
 ---
 
