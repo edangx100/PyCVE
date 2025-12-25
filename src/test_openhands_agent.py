@@ -17,15 +17,6 @@ if not api_key:
     print("Error: OPENROUTER_API_KEY not found in .env")
     exit(1)
 
-# Ensure all OpenRouter environment variables are set BEFORE importing SDK
-# LiteLLM requires OPENROUTER_API_KEY (confirmed by search results)
-os.environ["OPENROUTER_API_KEY"] = api_key
-# Also set the base URL as OPENAI_API_BASE (LiteLLM compatibility)
-os.environ["OPENAI_API_BASE"] = "https://openrouter.ai/api/v1"
-# OpenRouter-specific headers
-os.environ["OR_SITE_URL"] = "http://localhost"
-os.environ["OR_APP_NAME"] = "PyCVE OpenHands Test"
-
 # NOW import OpenHands SDK after environment is configured
 from openhands.sdk import LLM, Agent, Conversation, Tool
 from openhands.sdk.conversation.response_utils import get_agent_final_response
