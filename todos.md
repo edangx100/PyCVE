@@ -36,12 +36,12 @@ Each task below delivers a small, testable increment that you can interact with 
 ## Phase 2: Minimal UI & Core Flow
 
 ### ✅ Task 4: Gradio UI Skeleton
-- [ ] Create `app.py` with Gradio interface
-- [ ] Add Textbox for GitHub repo URL input
-- [ ] Add "Run Scan" button
-- [ ] Add Textbox for live log output
-- [ ] Button click returns "Preflight started..." message
-- [ ] **test**: Launch Gradio UI, enter a URL, click button, see acknowledgment message
+- [x] Create `app.py` with Gradio interface
+- [x] Add Textbox for GitHub repo URL input
+- [x] Add "Run Scan" button
+- [x] Add Textbox for live log output
+- [x] Button click returns "Preflight started..." message
+- [x] **test**: Launch Gradio UI, enter a URL, click button, see acknowledgment message
 
 ---
 
