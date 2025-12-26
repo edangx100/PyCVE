@@ -200,6 +200,7 @@ class Coordinator:
             workspace_dir=workspace_dir,
             artifacts_dir=artifacts_dir,
         )
+        final_ok = True
         if scan_ok:
             # Build and emit the direct-dependency worklist based on the audit JSON.
             audit_path = os.path.join(artifacts_dir, "pip_audit_before.json")
@@ -268,10 +269,17 @@ class Coordinator:
                     else:
                         self.latest_patch_notes = ""
                         yield "[fix] Patch notes not generated"
+            # After all fixes, run a final audit and write the "after" artifacts.
+            final_ok, _, _ = yield from self.run_final_audit_stream(
+                requirements_path=requirements_path,
+                workspace_dir=workspace_dir,
+                artifacts_dir=artifacts_dir,
+                before_audit_path=audit_path,
+            )
         else:
             # Clear any previous worklist if the scan failed.
             self.latest_worklist = []
-        status = "success" if scan_ok else "failed"
+        status = "success" if scan_ok and final_ok else "failed"
         yield f"[run] COMPLETE: {status}"
 
     @staticmethod
@@ -685,6 +693,61 @@ class Coordinator:
         else:
             yield f"[scan] Vulnerabilities found: {vuln_count}"
         return True
+
+    def run_final_audit_stream(
+        self,
+        requirements_path: str,
+        workspace_dir: str,
+        artifacts_dir: str,
+        before_audit_path: str,
+    ) -> Generator[str, None, tuple[bool, Optional[int], Optional[int]]]:
+        """Run a final pip-audit and write after/alias artifacts."""
+        yield "[final] Starting final pip-audit"
+
+        # Reuse the existing venv from the baseline scan to avoid reinstalling tools.
+        venv_dir = os.path.join(workspace_dir, ".venv")
+        if not os.path.isdir(venv_dir):
+            yield "[final] FAILED: venv not found; cannot run final pip-audit"
+            return False, None, None
+
+        # Run pip-audit and surface any stderr notes in the live log.
+        audit_json, audit_notes = self._run_pip_audit_json(venv_dir, requirements_path)
+        if audit_notes:
+            for note in audit_notes:
+                if note:
+                    yield f"[final][stderr] {note}"
+        if audit_json is None:
+            yield "[final] FAILED: pip-audit produced no JSON output"
+            return False, None, None
+
+        # Write the final audit output as pip_audit_after.json.
+        after_path = os.path.join(artifacts_dir, "pip_audit_after.json")
+        try:
+            with open(after_path, "w", encoding="utf-8") as handle:
+                handle.write(audit_json)
+            yield f"[final] Saved artifact: {after_path}"
+        except OSError as exc:
+            yield f"[final] FAILED: unable to write after audit JSON: {exc}"
+            return False, None, None
+
+        # Mirror the final output to pip_audit.json for downstream consumers.
+        alias_path = os.path.join(artifacts_dir, "pip_audit.json")
+        try:
+            shutil.copyfile(after_path, alias_path)
+            yield f"[final] Saved alias: {alias_path}"
+        except OSError as exc:
+            yield f"[final] FAILED: unable to write pip_audit.json alias: {exc}"
+            return False, None, None
+
+        # Compare before/after vulnerability counts for UI reporting.
+        before_raw = self._read_text_file(before_audit_path)
+        before_count = self._count_vulnerabilities(before_raw) if before_raw else None
+        after_count = self._count_vulnerabilities(audit_json)
+        if before_count is None or after_count is None:
+            yield "[final] Vulnerability counts unavailable (JSON parse failed)"
+        else:
+            yield f"[final] Vulnerabilities before: {before_count} | after: {after_count}"
+        return True, before_count, after_count
 
     @staticmethod
     def _read_text_file(path: str) -> str:

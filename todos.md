@@ -120,11 +120,11 @@ Each task below delivers a small, testable increment that you can interact with 
 ## Phase 5: Final Verification & Artifacts
 
 ### ✅ Task 12: Final Audit & Comparison
-- [ ] After all fixes, run final `pip-audit -r requirements.txt --format json`
-- [ ] Save to `artifacts/<run_id>/pip_audit_after.json`
-- [ ] Create alias `artifacts/<run_id>/pip_audit.json` (copy of after)
-- [ ] Display before/after vulnerability counts in UI
-- [ ] **test**: See final audit artifact, compare before/after manually
+- [x] After all fixes, run final `pip-audit -r requirements.txt --format json`
+- [x] Save to `artifacts/<run_id>/pip_audit_after.json`
+- [x] Create alias `artifacts/<run_id>/pip_audit.json` (copy of after)
+- [x] Display before/after vulnerability counts in UI
+- [x] **test**: See final audit artifact, compare before/after manually
 
 ---
 
