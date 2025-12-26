@@ -139,11 +139,11 @@ Each task below delivers a small, testable increment that you can interact with 
 ---
 
 ### ✅ Task 14: SUMMARY.md Generation
-- [ ] Generate `SUMMARY.md` with all required sections (per plan.md:469-488)
-- [ ] Include: run metadata, status, counts, results table with links to patch notes
-- [ ] Save to artifacts directory
-- [ ] Display summary in UI or provide download link
-- [ ] **test**: Read SUMMARY.md, verify it's clear and complete
+- [x] Generate `SUMMARY.md` with all required sections (per plan.md:469-488)
+- [x] Include: run metadata, status, counts, results table with links to patch notes
+- [x] Save to artifacts directory
+- [x] Display summary in UI or provide download link
+- [x] **test**: Read SUMMARY.md, verify it's clear and complete
 
 ---
 

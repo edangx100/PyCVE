@@ -7,6 +7,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -50,6 +51,8 @@ class Coordinator:
         self.latest_patch_notes: str = ""
         self.patch_notes_paths: list[str] = []
         self.latest_cve_summary: str = "CVE summary: pending"
+        self.latest_summary: str = ""
+        self.latest_summary_path: str = ""
         register_fixer_agent()
 
     def clone_repo_stream(
@@ -68,12 +71,15 @@ class Coordinator:
             return
 
         run_id = run_id or self._new_run_id()
+        run_started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         workspace_root = os.path.abspath(workspace_root)
         workspace_dir = os.path.join(workspace_root, run_id)
         repo_dir = os.path.join(workspace_dir, "repo")
         self.latest_patch_notes = ""
         self.patch_notes_paths = []
         self.latest_cve_summary = "CVE summary: pending"
+        self.latest_summary = ""
+        self.latest_summary_path = ""
 
         # Each run gets an isolated workspace to keep artifacts and venvs separate.
         os.makedirs(workspace_dir, exist_ok=True)
@@ -203,6 +209,9 @@ class Coordinator:
             workspace_dir=workspace_dir,
             artifacts_dir=artifacts_dir,
         )
+        worklist: list[WorklistItem] = []
+        before_count: Optional[int] = None
+        after_count: Optional[int] = None
         final_ok = True
         if scan_ok:
             # Build and emit the direct-dependency worklist based on the audit JSON.
@@ -273,7 +282,7 @@ class Coordinator:
                         self.latest_patch_notes = ""
                         yield "[fix] Patch notes not generated"
             # After all fixes, run a final audit and write the "after" artifacts.
-            final_ok, _, _ = yield from self.run_final_audit_stream(
+            final_ok, before_count, after_count = yield from self.run_final_audit_stream(
                 requirements_path=requirements_path,
                 workspace_dir=workspace_dir,
                 artifacts_dir=artifacts_dir,
@@ -300,6 +309,24 @@ class Coordinator:
                 else:
                     self.latest_cve_summary = "CVE summary: unavailable"
                     yield "[cve] FAILED: unable to write cve_status.json"
+            summary_status = "SUCCESS" if scan_ok and final_ok else "FAILED"
+            summary_ok, summary_path = self.write_summary(
+                artifacts_dir=artifacts_dir,
+                run_id=run_id,
+                run_started_at=run_started_at,
+                repo_url=repo_url,
+                repo_dir=repo_dir,
+                status=summary_status,
+                before_count=before_count,
+                after_count=after_count,
+                worklist=worklist,
+                venv_dir=os.path.join(workspace_dir, ".venv"),
+            )
+            if summary_ok:
+                self.latest_summary = self._read_text_file(summary_path)
+                yield f"[summary] Saved artifact: {summary_path}"
+            else:
+                yield "[summary] FAILED: unable to write SUMMARY.md"
         else:
             # Clear any previous worklist if the scan failed.
             self.latest_worklist = []
@@ -850,6 +877,231 @@ class Coordinator:
         except OSError:
             return False, None, None
         return True, fixed_count, remaining_count
+
+    def write_summary(
+        self,
+        artifacts_dir: str,
+        run_id: str,
+        run_started_at: str,
+        repo_url: str,
+        repo_dir: str,
+        status: str,
+        before_count: Optional[int],
+        after_count: Optional[int],
+        worklist: list[WorklistItem],
+        venv_dir: Optional[str],
+    ) -> tuple[bool, str]:
+        """Write SUMMARY.md to the artifacts directory."""
+        # Build the summary text first so we can cache and reuse it for the UI.
+        summary_text = self._build_summary_text(
+            run_id=run_id,
+            run_started_at=run_started_at,
+            repo_url=repo_url,
+            repo_dir=repo_dir,
+            status=status,
+            before_count=before_count,
+            after_count=after_count,
+            worklist=worklist,
+            artifacts_dir=artifacts_dir,
+            venv_dir=venv_dir,
+        )
+        summary_path = os.path.join(artifacts_dir, "SUMMARY.md")
+        try:
+            with open(summary_path, "w", encoding="utf-8") as handle:
+                handle.write(summary_text)
+        except OSError:
+            return False, summary_path
+        self.latest_summary = summary_text
+        self.latest_summary_path = summary_path
+        return True, summary_path
+
+    def _build_summary_text(
+        self,
+        run_id: str,
+        run_started_at: str,
+        repo_url: str,
+        repo_dir: str,
+        status: str,
+        before_count: Optional[int],
+        after_count: Optional[int],
+        worklist: list[WorklistItem],
+        artifacts_dir: str,
+        venv_dir: Optional[str],
+    ) -> str:
+        """Build the Markdown summary body for the run."""
+        # Collect all metadata and results before formatting the Markdown body.
+        commit_hash = self._git_commit_hash(repo_dir) or "unknown"
+        versions = self._collect_tool_versions(venv_dir)
+        rows, fixed_count, skipped_count = self._build_summary_rows(
+            worklist=worklist,
+            artifacts_dir=artifacts_dir,
+        )
+        before_display = "unknown" if before_count is None else str(before_count)
+        after_display = "unknown" if after_count is None else str(after_count)
+
+        # Read MCP config from env so the summary reflects runtime settings.
+        mcp_enabled = os.getenv("OSV_MCP_ENABLED", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        mcp_status = "OK" if mcp_enabled else "UNAVAILABLE"
+        mcp_error = "" if mcp_enabled else "not configured"
+
+        # Compose a deterministic Markdown structure for easy reading and diffing.
+        lines = [
+            "# PyCVE Summary",
+            "",
+            "## Run Metadata",
+            f"- run_id: {run_id}",
+            f"- timestamp: {run_started_at}",
+            f"- repo_url: {repo_url}",
+            f"- commit: {commit_hash}",
+            f"- python: {versions.get('python', 'unknown')}",
+            f"- pip: {versions.get('pip', 'unknown')}",
+            f"- pip-audit: {versions.get('pip_audit', 'unknown')}",
+        ]
+        if "uv" in versions:
+            lines.append(f"- uv: {versions.get('uv', 'unknown')}")
+        lines.extend(
+            [
+                "",
+                "## Status",
+                f"- status: {status}",
+                f"- vulnerabilities_before: {before_display}",
+                f"- vulnerabilities_after: {after_display}",
+                f"- packages_fixed: {fixed_count}",
+                f"- packages_skipped: {skipped_count}",
+                "",
+                "## MCP",
+                f"- enabled: {'true' if mcp_enabled else 'false'}",
+                f"- status: {mcp_status}",
+                f"- error: {mcp_error or 'none'}",
+                "",
+                "## Results",
+                "| package | vuln_ids | action | patch_notes |",
+                "| --- | --- | --- | --- |",
+            ]
+        )
+        if rows:
+            for package, vuln_ids, action, patch_link in rows:
+                lines.append(f"| {package} | {vuln_ids} | {action} | {patch_link} |")
+        else:
+            # Keep the table header even when no worklist rows exist.
+            lines.append("| (none) | (none) | (none) | (none) |")
+        return "\n".join(lines) + "\n"
+
+    def _build_summary_rows(
+        self,
+        worklist: list[WorklistItem],
+        artifacts_dir: str,
+    ) -> tuple[list[tuple[str, str, str, str]], int, int]:
+        """Build result rows + fixed/skipped counts for SUMMARY.md."""
+        rows: list[tuple[str, str, str, str]] = []
+        fixed_count = 0
+        for item in worklist:
+            # Use patch notes (if present) to derive the verification status.
+            patch_path = os.path.join(
+                artifacts_dir,
+                f"PATCH_NOTES_{self._sanitize_filename(item.name)}.md",
+            )
+            patch_link = "none"
+            status = None
+            if os.path.isfile(patch_path):
+                patch_link = (
+                    f"[{os.path.basename(patch_path)}]({os.path.basename(patch_path)})"
+                )
+                status = self._parse_patch_status(self._read_text_file(patch_path))
+            action = "fixed" if status == "verified: vuln removed" else "skipped"
+            if action == "fixed":
+                fixed_count += 1
+            vuln_ids = ", ".join(self._order_vuln_ids(item.vuln_ids)) or "unknown"
+            rows.append((item.name, vuln_ids, action, patch_link))
+        # Count remaining packages that did not verify as fixed.
+        skipped_count = max(0, len(worklist) - fixed_count)
+        return rows, fixed_count, skipped_count
+
+    def _collect_tool_versions(self, venv_dir: Optional[str]) -> dict[str, str]:
+        """Collect tool version strings for the summary metadata."""
+        versions: dict[str, str] = {}
+        if venv_dir and os.path.isdir(venv_dir):
+            # Prefer the venv so reported versions match what pip-audit used.
+            venv_python = self._venv_python(venv_dir)
+            versions["python"] = self._run_version_cmd([venv_python, "-V"]) or "unknown"
+            versions["pip"] = (
+                self._run_version_cmd([venv_python, "-m", "pip", "--version"]) or "unknown"
+            )
+            versions["pip_audit"] = (
+                self._run_version_cmd([venv_python, "-m", "pip_audit", "--version"])
+                or "unknown"
+            )
+        else:
+            # Fall back to the host interpreter if the venv is unavailable.
+            versions["python"] = f"Python {sys.version.split()[0]}"
+            versions["pip"] = (
+                self._run_version_cmd([sys.executable, "-m", "pip", "--version"]) or "unknown"
+            )
+            versions["pip_audit"] = (
+                self._run_version_cmd([sys.executable, "-m", "pip_audit", "--version"])
+                or "unknown"
+            )
+        if shutil.which("uv"):
+            # Only report uv when the binary is on PATH.
+            versions["uv"] = self._run_version_cmd(["uv", "--version"]) or "unknown"
+        return versions
+
+    def _run_version_cmd(self, args: list[str], cwd: Optional[str] = None) -> Optional[str]:
+        """Run a command and return the first non-empty output line."""
+        try:
+            result = self._run_command(args, cwd=cwd)
+        except FileNotFoundError:
+            return None
+        output = result.stdout.strip() or result.stderr.strip()
+        if not output:
+            return None
+        # Normalize to a single line to keep summary output concise.
+        return output.splitlines()[0].strip()
+
+    def _git_commit_hash(self, repo_dir: str) -> Optional[str]:
+        """Return the git commit hash for the cloned repo."""
+        try:
+            result = self._run_command(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+        except FileNotFoundError:
+            return None
+        if result.returncode != 0:
+            return None
+        # Use the exact HEAD hash for traceability in SUMMARY.md.
+        return result.stdout.strip() or None
+
+    @staticmethod
+    def _parse_patch_status(notes: str) -> Optional[str]:
+        """Extract the verification status line from patch notes."""
+        for line in notes.splitlines():
+            cleaned = line.strip()
+            if cleaned.lower().startswith("- status:"):
+                # Keep only the status value so callers can map to actions.
+                return cleaned.split(":", 1)[1].strip()
+        return None
+
+    @staticmethod
+    def _order_vuln_ids(vuln_ids: list[str]) -> list[str]:
+        """Sort vulnerability IDs with CVEs first while de-duplicating."""
+        seen: set[str] = set()
+        cves: list[str] = []
+        others: list[str] = []
+        for vuln_id in vuln_ids:
+            if not vuln_id:
+                continue
+            cleaned = str(vuln_id).strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            if cleaned.upper().startswith("CVE-"):
+                cves.append(cleaned)
+            else:
+                others.append(cleaned)
+        # Emit CVEs first to keep the summary table easy to scan.
+        return cves + others
 
     def _build_cve_status_payload(
         self,
