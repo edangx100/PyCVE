@@ -99,12 +99,12 @@ Each task below delivers a small, testable increment that you can interact with 
 ---
 
 ### ✅ Task 10: Spot-Check Verification
-- [ ] After Fixer edits requirements.txt, re-run pip-audit
-- [ ] Compare vulnerability count for that specific package (before vs after)
-- [ ] If worse, revert edit and mark as failed in patch notes
-- [ ] Update patch notes with verification result
-- [ ] Display verification status in UI
-- [ ] **test**: Confirm patch notes show "verified: vuln removed" or "verified: failed"
+- [x] After Fixer edits requirements.txt, re-run pip-audit
+- [x] Compare vulnerability count for that specific package (before vs after)
+- [x] If worse, revert edit and mark as failed in patch notes
+- [x] Update patch notes with verification result
+- [x] Display verification status in UI
+- [x] **test**: Confirm patch notes show "verified: vuln removed" or "verified: failed"
 
 ---
 
