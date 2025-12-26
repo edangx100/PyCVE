@@ -48,6 +48,7 @@ class Coordinator:
         )
         self.latest_worklist: list[WorklistItem] = []
         self.latest_patch_notes: str = ""
+        self.patch_notes_paths: list[str] = []
         register_fixer_agent()
 
     def clone_repo_stream(
@@ -69,6 +70,7 @@ class Coordinator:
         workspace_dir = os.path.join(workspace_root, run_id)
         repo_dir = os.path.join(workspace_dir, "repo")
         self.latest_patch_notes = ""
+        self.patch_notes_paths = []
 
         # Each run gets an isolated workspace to keep artifacts and venvs separate.
         os.makedirs(workspace_dir, exist_ok=True)
@@ -212,49 +214,60 @@ class Coordinator:
                 fix_versions = ", ".join(item.fix_versions) if item.fix_versions else "unknown"
                 yield f"[worklist] {item.name} {spec} -> {vuln_ids} | fixes: {fix_versions}"
             if worklist:
-                # Task 9 MVP: delegate only the first direct dependency; Task 11 loops all.
+                # Task 11: iterate through the full worklist and fix packages serially.
+                # Map normalized names to requirement entries so fixer prompts have line context.
                 entry_map = {
                     self._normalize_name(entry.name): entry for entry in parse_result.editable
                 }
-                target = worklist[0]
-                entry = entry_map.get(self._normalize_name(target.name))
-                yield f"[fix] Delegating package: {target.name}"
-                patch_notes, patch_path = self._run_fixer_once(
-                    item=target,
-                    entry=entry,
-                    requirements_path=requirements_path,
-                    artifacts_dir=artifacts_dir,
-                    workspace_dir=workspace_dir,
-                )
-                if patch_notes is not None:
-                    # Spot-check the fix by re-running pip-audit and updating patch notes.
-                    before_audit_path = os.path.join(artifacts_dir, "pip_audit_before.json")
-                    backup_path = os.path.join(
-                        os.path.dirname(requirements_path),
-                        "requirements_before.txt",
-                    )
-                    status, before_count, after_count, reverted = self._spot_check_fix(
-                        package_name=target.name,
+                total = len(worklist)
+                yield f"[fix] Starting fix loop: {total} package(s)"
+                for index, target in enumerate(worklist, start=1):
+                    entry = entry_map.get(self._normalize_name(target.name))
+                    # Emit progress so the UI can render a package-level progress bar.
+                    yield f"[fix] Progress: {index}/{total} ({target.name})"
+                    yield f"[fix] Delegating package: {target.name}"
+                    patch_notes, patch_path = self._run_fixer_once(
+                        item=target,
+                        entry=entry,
                         requirements_path=requirements_path,
-                        backup_path=backup_path,
                         artifacts_dir=artifacts_dir,
                         workspace_dir=workspace_dir,
-                        patch_notes_path=patch_path,
-                        before_audit_path=before_audit_path,
                     )
-                    before_display = "unknown" if before_count is None else str(before_count)
-                    after_display = "unknown" if after_count is None else str(after_count)
-                    revert_note = " (reverted)" if reverted else ""
-                    yield (
-                        f"[verify] {target.name}: {status} "
-                        f"(before {before_display}, after {after_display}){revert_note}"
-                    )
-                    # Cache patch notes for the UI to display the latest fix result.
-                    self.latest_patch_notes = self._read_text_file(patch_path)
-                    yield f"[fix] Patch notes saved: {patch_path}"
-                else:
-                    self.latest_patch_notes = ""
-                    yield "[fix] Patch notes not generated"
+                    if os.path.isfile(patch_path):
+                        # Track patch note paths so downstream UI can list all artifacts.
+                        self.patch_notes_paths.append(patch_path)
+                    if patch_notes is not None:
+                        # Spot-check the fix by re-running pip-audit and updating patch notes.
+                        before_audit_path = os.path.join(
+                            artifacts_dir,
+                            "pip_audit_before.json",
+                        )
+                        backup_path = os.path.join(
+                            os.path.dirname(requirements_path),
+                            "requirements_before.txt",
+                        )
+                        status, before_count, after_count, reverted = self._spot_check_fix(
+                            package_name=target.name,
+                            requirements_path=requirements_path,
+                            backup_path=backup_path,
+                            artifacts_dir=artifacts_dir,
+                            workspace_dir=workspace_dir,
+                            patch_notes_path=patch_path,
+                            before_audit_path=before_audit_path,
+                        )
+                        before_display = "unknown" if before_count is None else str(before_count)
+                        after_display = "unknown" if after_count is None else str(after_count)
+                        revert_note = " (reverted)" if reverted else ""
+                        yield (
+                            f"[verify] {target.name}: {status} "
+                            f"(before {before_display}, after {after_display}){revert_note}"
+                        )
+                        # Cache patch notes for the UI to display the latest fix result.
+                        self.latest_patch_notes = self._read_text_file(patch_path)
+                        yield f"[fix] Patch notes saved: {patch_path}"
+                    else:
+                        self.latest_patch_notes = ""
+                        yield "[fix] Patch notes not generated"
         else:
             # Clear any previous worklist if the scan failed.
             self.latest_worklist = []
@@ -706,6 +719,65 @@ class Coordinator:
             return None
         return content_a != content_b
 
+    def _find_requirement_line(self, path: str, package_name: str) -> Optional[str]:
+        """Return the raw requirement line for a package from the given file."""
+        normalized_target = self._normalize_name(package_name)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line_no, raw_line in enumerate(handle, start=1):
+                    # Skip blank/comment lines and parse only simple editable requirements.
+                    cleaned = self._strip_inline_comment(raw_line)
+                    if not cleaned.strip():
+                        continue
+                    parsed = self._parse_editable_requirement(cleaned.strip(), line_no)
+                    if not parsed:
+                        continue
+                    # Match on normalized name so casing and separators do not matter.
+                    if self._normalize_name(parsed.name) == normalized_target:
+                        return raw_line.strip()
+        except OSError:
+            return None
+        return None
+
+    def _write_fallback_patch_notes(
+        self,
+        item: WorklistItem,
+        requirements_path: str,
+        backup_path: str,
+        patch_notes_path: str,
+    ) -> None:
+        """Write minimal patch notes if the Fixer agent failed to create them."""
+        # Derive before/after lines from the backup and current requirements.
+        before_line = self._find_requirement_line(backup_path, item.name)
+        after_line = self._find_requirement_line(requirements_path, item.name)
+        vuln_block = ", ".join(item.vuln_ids) if item.vuln_ids else "(none)"
+        # Build a lightweight note so verification can still append results.
+        notes = [
+            f"# Package: {item.name}",
+            "",
+            "## Vulnerabilities",
+            vuln_block,
+            "",
+            "## Before",
+            before_line or "(unknown)",
+            "",
+            "## After",
+            after_line or "(unknown)",
+            "",
+            "## Notes",
+            (
+                "Coordinator generated patch notes because the Fixer agent did not write them."
+            ),
+        ]
+        if os.path.isfile(backup_path):
+            notes.append(f"Backup created at {backup_path}")
+        try:
+            with open(patch_notes_path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(notes))
+                handle.write("\n")
+        except OSError:
+            return
+
     def _run_pip_audit_json(
         self,
         venv_dir: str,
@@ -938,12 +1010,17 @@ class Coordinator:
         conversation.send_message(coordinator_prompt)
         conversation.run()
 
-        try:
-            # Read patch notes for UI display and return path for logging.
-            with open(patch_notes_path, "r", encoding="utf-8") as handle:
-                return handle.read(), patch_notes_path
-        except OSError:
-            return None, patch_notes_path
+        patch_notes = self._read_text_file(patch_notes_path)
+        if not patch_notes.strip():
+            # Create fallback patch notes so verification can append results.
+            self._write_fallback_patch_notes(
+                item,
+                requirements_path,
+                backup_path,
+                patch_notes_path,
+            )
+            patch_notes = self._read_text_file(patch_notes_path)
+        return (patch_notes or None), patch_notes_path
 
 
 @dataclass

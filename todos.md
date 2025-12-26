@@ -109,11 +109,11 @@ Each task below delivers a small, testable increment that you can interact with 
 ---
 
 ### ✅ Task 11: Multi-Package Fix Loop
-- [ ] Coordinator iterates through entire worklist (serialized)
-- [ ] Delegate each package to Fixer one at a time
-- [ ] Display progress bar (e.g., "Fixing package 2/5...")
-- [ ] Collect all patch notes
-- [ ] **test**: Use repo with 3+ vulnerable packages, see all get processed sequentially
+- [x] Coordinator iterates through entire worklist (serialized)
+- [x] Delegate each package to Fixer one at a time
+- [x] Display progress bar (e.g., "Fixing package 2/5...")
+- [x] Collect all patch notes
+- [x] **test**: Use repo with 3+ vulnerable packages, see all get processed sequentially
 
 ---
 
