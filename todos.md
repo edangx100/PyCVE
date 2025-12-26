@@ -88,13 +88,13 @@ Each task below delivers a small, testable increment that you can interact with 
 ## Phase 4: Fixing (Single Package MVP)
 
 ### ✅ Task 9: Fixer Agent (Single Package)
-- [ ] Create Fixer agent skeleton
-- [ ] Coordinator delegates ONE package from worklist to Fixer (use DelegateTool)
-- [ ] Fixer receives package context (name, current spec, vuln, fix version)
-- [ ] Fixer applies safe edit to requirements.txt (use FileEditorTool)
-- [ ] Fixer writes `PATCH_NOTES_<pkg>.md` with before/after
-- [ ] Display patch notes content in UI
-- [ ] **test**: See requirements.txt edited, patch notes generated for one package
+- [x] Create Fixer agent skeleton
+- [x] Coordinator delegates ONE package from worklist to Fixer (use DelegateTool)
+- [x] Fixer receives package context (name, current spec, vuln, fix version)
+- [x] Fixer applies safe edit to requirements.txt (use FileEditorTool). Before modifying requirements.txt, create a duplicate and save it as requirements_before.txt
+- [x] Fixer writes `PATCH_NOTES_<pkg>.md` with before/after
+- [x] Display patch notes content in UI
+- [x] **test**: See requirements.txt edited, patch notes generated for one package
 
 ---
 

@@ -16,7 +16,10 @@ from typing import Generator, Optional
 from dotenv import load_dotenv
 from openhands.sdk import Agent, Conversation, LLM, Tool
 from openhands.sdk.event import ObservationEvent
+from openhands.tools.delegate import DelegateTool
 from openhands.tools.terminal import TerminalTool
+
+from src.agents.fixer import FixerTask, register_fixer_agent
 
 
 class Coordinator:
@@ -39,9 +42,12 @@ class Coordinator:
                     name=TerminalTool.name,
                     params={"terminal_type": "subprocess"},
                 ),
+                Tool(name=DelegateTool.name),
             ],
         )
         self.latest_worklist: list[WorklistItem] = []
+        self.latest_patch_notes: str = ""
+        register_fixer_agent()
 
     def clone_repo_stream(
         self,
@@ -61,6 +67,7 @@ class Coordinator:
         workspace_root = os.path.abspath(workspace_root)
         workspace_dir = os.path.join(workspace_root, run_id)
         repo_dir = os.path.join(workspace_dir, "repo")
+        self.latest_patch_notes = ""
 
         # Each run gets an isolated workspace to keep artifacts and venvs separate.
         os.makedirs(workspace_dir, exist_ok=True)
@@ -203,6 +210,28 @@ class Coordinator:
                 vuln_ids = ", ".join(item.vuln_ids) if item.vuln_ids else "unknown"
                 fix_versions = ", ".join(item.fix_versions) if item.fix_versions else "unknown"
                 yield f"[worklist] {item.name} {spec} -> {vuln_ids} | fixes: {fix_versions}"
+            if worklist:
+                # Task 9 MVP: delegate only the first direct dependency; Task 11 loops all.
+                entry_map = {
+                    self._normalize_name(entry.name): entry for entry in parse_result.editable
+                }
+                target = worklist[0]
+                entry = entry_map.get(self._normalize_name(target.name))
+                yield f"[fix] Delegating package: {target.name}"
+                patch_notes, patch_path = self._run_fixer_once(
+                    item=target,
+                    entry=entry,
+                    requirements_path=requirements_path,
+                    artifacts_dir=artifacts_dir,
+                    workspace_dir=workspace_dir,
+                )
+                if patch_notes:
+                    # Cache patch notes for the UI to display the latest fix result.
+                    self.latest_patch_notes = patch_notes
+                    yield f"[fix] Patch notes saved: {patch_path}"
+                else:
+                    self.latest_patch_notes = ""
+                    yield "[fix] Patch notes not generated"
         else:
             # Clear any previous worklist if the scan failed.
             self.latest_worklist = []
@@ -423,6 +452,12 @@ class Coordinator:
         return re.sub(r"[-_.]+", "-", name).lower()
 
     @staticmethod
+    def _sanitize_filename(value: str) -> str:
+        """Make a safe filename segment from a package name."""
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_")
+        return cleaned or "package"
+
+    @staticmethod
     def _extract_audit_items(payload: object) -> list[dict]:
         """Return a list of dependency dicts from pip-audit JSON output."""
         # pip-audit may return a list or wrap dependencies in a dict; normalize to list[dict].
@@ -614,6 +649,51 @@ class Coordinator:
         else:
             yield f"[scan] Vulnerabilities found: {vuln_count}"
         return True
+
+    def _run_fixer_once(
+        self,
+        item: WorklistItem,
+        entry: Optional[RequirementEntry],
+        requirements_path: str,
+        artifacts_dir: str,
+        workspace_dir: str,
+    ) -> tuple[Optional[str], str]:
+        # Package up a single fix request with file paths and context.
+        fix_version = item.fix_versions[0] if item.fix_versions else None
+        patch_notes_name = f"PATCH_NOTES_{self._sanitize_filename(item.name)}.md"
+        patch_notes_path = os.path.join(artifacts_dir, patch_notes_name)
+        backup_path = os.path.join(os.path.dirname(requirements_path), "requirements_before.txt")
+        task = FixerTask(
+            package=item.name,
+            current_spec=item.spec,
+            vuln_ids=item.vuln_ids,
+            fix_version=fix_version,
+            requirements_path=requirements_path,
+            requirements_before_path=backup_path,
+            patch_notes_path=patch_notes_path,
+            raw_line=entry.raw if entry else None,
+            line_no=entry.line_no if entry else None,
+        )
+        # Delegate the task to a Fixer sub-agent so only FileEditorTool is used.
+        conversation = Conversation(agent=self.agent, workspace=workspace_dir)
+        fixer_prompt = task.prompt()
+        coordinator_prompt = (
+            "You are the Coordinator agent. Use DelegateTool to spawn a sub-agent "
+            "with id 'fixer' using agent type 'fixer'. "
+            "Delegate the following task to the fixer agent exactly.\n"
+            "BEGIN FIXER PROMPT\n"
+            f"{fixer_prompt}\n"
+            "END FIXER PROMPT"
+        )
+        conversation.send_message(coordinator_prompt)
+        conversation.run()
+
+        try:
+            # Read patch notes for UI display and return path for logging.
+            with open(patch_notes_path, "r", encoding="utf-8") as handle:
+                return handle.read(), patch_notes_path
+        except OSError:
+            return None, patch_notes_path
 
 
 @dataclass

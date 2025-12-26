@@ -9,14 +9,16 @@ def start_scan(repo_url: str):
     # Gradio streaming callback: yield incremental log output.
     log_lines = ["Preflight started..."]
     table_rows: list[list[str]] = []
-    yield "\n".join(log_lines), table_rows
+    # Keep the latest patch notes so the UI can show the most recent fix.
+    patch_notes = ""
+    yield "\n".join(log_lines), table_rows, patch_notes
 
     try:
         # Coordinator owns the OpenHands agent and clone workflow.
         coordinator = Coordinator()
     except Exception as exc:
         log_lines.append(f"[error] {exc}")
-        yield "\n".join(log_lines), table_rows
+        yield "\n".join(log_lines), table_rows, patch_notes
         return
 
     # Run workspace directory on the host for now.
@@ -31,12 +33,14 @@ def start_scan(repo_url: str):
         ):
             log_lines.append(line)
             table_rows = coordinator.worklist_table_rows()
+            # Mirror the coordinator's cached patch notes into the UI.
+            patch_notes = coordinator.latest_patch_notes
             if line.startswith("[run] COMPLETE:"):
                 final_status = line
-            yield "\n".join(log_lines), table_rows
+            yield "\n".join(log_lines), table_rows, patch_notes
     except Exception as exc:
         log_lines.append(f"[error] {exc}")
-        yield "\n".join(log_lines), table_rows
+        yield "\n".join(log_lines), table_rows, patch_notes
     finally:
         if final_status:
             print(final_status)
@@ -53,7 +57,12 @@ with gr.Blocks(title="PyCVE") as demo:
         label="Direct Dependency Worklist",
         interactive=False,
     )
-    run_button.click(start_scan, inputs=repo_input, outputs=[log_output, worklist_table])
+    patch_notes = gr.Textbox(label="Patch Notes (Latest)", lines=12, interactive=False)
+    run_button.click(
+        start_scan,
+        inputs=repo_input,
+        outputs=[log_output, worklist_table, patch_notes],
+    )
 
 
 if __name__ == "__main__":
