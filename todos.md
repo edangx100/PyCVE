@@ -148,14 +148,14 @@ Each task below delivers a small, testable increment that you can interact with 
 ---
 
 ### ✅ Task 15: Artifact Download Links
-- [ ] Add Gradio File components for all artifacts:
+- [x] Add Gradio File components for all artifacts:
   - SUMMARY.md
   - cve_status.json
   - pip_audit_before.json
   - pip_audit_after.json
   - All PATCH_NOTES_*.md files
-- [ ] Artifacts downloadable even on SKIPPED/FAILED runs (use stubs if needed)
-- [ ] **test**: Complete a full run, download all artifacts, verify they're valid
+- [x] Artifacts downloadable even on SKIPPED/FAILED runs (use stubs if needed)
+- [x] **test**: Complete a full run, download all artifacts, verify they're valid
 
 ---
 

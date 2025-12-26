@@ -53,6 +53,7 @@ class Coordinator:
         self.latest_cve_summary: str = "CVE summary: pending"
         self.latest_summary: str = ""
         self.latest_summary_path: str = ""
+        self.latest_artifacts_dir: str = ""
         register_fixer_agent()
 
     def clone_repo_stream(
@@ -65,11 +66,8 @@ class Coordinator:
     ) -> Generator[str, None, None]:
         """Clone a repo in an agent workspace, then parse requirements and run pip-audit."""
         # Stream a git clone (and follow-on parse) while the agent runs in OpenHands.
-        if not repo_url or not repo_url.strip():
-            yield "[clone] FAILED: repo URL is required."
-            yield "[run] COMPLETE: failed"
-            return
-
+        repo_url_value = repo_url.strip() if repo_url else ""
+        repo_url_display = repo_url_value or "unknown"
         run_id = run_id or self._new_run_id()
         run_started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         workspace_root = os.path.abspath(workspace_root)
@@ -80,17 +78,35 @@ class Coordinator:
         self.latest_cve_summary = "CVE summary: pending"
         self.latest_summary = ""
         self.latest_summary_path = ""
+        self.latest_artifacts_dir = ""
 
         # Each run gets an isolated workspace to keep artifacts and venvs separate.
         os.makedirs(workspace_dir, exist_ok=True)
+        artifacts_dir = self._init_artifacts_dir(artifacts_root, run_id)
 
+        yield f"[artifacts] Directory: {artifacts_dir}"
         yield f"[clone] Run ID: {run_id}"
         yield f"[clone] Workspace: {workspace_dir}"
-        yield f"[clone] Repo URL: {repo_url}"
+        yield f"[clone] Repo URL: {repo_url_display}"
+
+        if not repo_url_value:
+            yield "[clone] FAILED: repo URL is required."
+            self._write_stub_run_artifacts(
+                artifacts_dir=artifacts_dir,
+                run_id=run_id,
+                run_started_at=run_started_at,
+                repo_url=repo_url_display,
+                repo_dir=repo_dir,
+                status="FAILED",
+                reason_code="missing_repo_url",
+                reason_detail="repo URL is required",
+            )
+            yield "[run] COMPLETE: failed"
+            return
 
         # Ask the agent to run the clone command in the workspace directory.
         conversation = Conversation(agent=self.agent, workspace=workspace_dir)
-        safe_url = shlex.quote(repo_url)
+        safe_url = shlex.quote(repo_url_value)
         clone_cmd = f"git clone --progress {safe_url} repo"
         task = (
             "You are the Coordinator agent. Use TerminalTool to clone the repo. "
@@ -150,11 +166,32 @@ class Coordinator:
 
         if run_errors:
             yield f"[clone] FAILED: {run_errors[0]}"
+            # Persist stub artifacts so the UI still has downloadable files on failure.
+            self._write_stub_run_artifacts(
+                artifacts_dir=artifacts_dir,
+                run_id=run_id,
+                run_started_at=run_started_at,
+                repo_url=repo_url_display,
+                repo_dir=repo_dir,
+                status="FAILED",
+                reason_code="clone_failed",
+                reason_detail=str(run_errors[0]),
+            )
             yield "[run] COMPLETE: failed"
             return
 
         if terminal_error:
             yield "[clone] FAILED: git clone reported an error."
+            self._write_stub_run_artifacts(
+                artifacts_dir=artifacts_dir,
+                run_id=run_id,
+                run_started_at=run_started_at,
+                repo_url=repo_url_display,
+                repo_dir=repo_dir,
+                status="FAILED",
+                reason_code="clone_failed",
+                reason_detail="git clone reported an error",
+            )
             yield "[run] COMPLETE: failed"
             return
 
@@ -162,6 +199,16 @@ class Coordinator:
             yield f"[clone] SUCCESS: {repo_dir}"
         else:
             yield "[clone] FAILED: repo directory not found after clone."
+            self._write_stub_run_artifacts(
+                artifacts_dir=artifacts_dir,
+                run_id=run_id,
+                run_started_at=run_started_at,
+                repo_url=repo_url_display,
+                repo_dir=repo_dir,
+                status="FAILED",
+                reason_code="clone_failed",
+                reason_detail="repo directory not found after clone",
+            )
             yield "[run] COMPLETE: failed"
             return
 
@@ -169,6 +216,16 @@ class Coordinator:
         requirements_path = os.path.join(repo_dir, "requirements.txt")
         if not os.path.isfile(requirements_path):
             yield f"[parse] SKIPPED: requirements.txt not found at {requirements_path}"
+            self._write_stub_run_artifacts(
+                artifacts_dir=artifacts_dir,
+                run_id=run_id,
+                run_started_at=run_started_at,
+                repo_url=repo_url_display,
+                repo_dir=repo_dir,
+                status="SKIPPED",
+                reason_code="missing_requirements",
+                reason_detail="requirements.txt not found",
+            )
             yield "[run] COMPLETE: skipped"
             return
 
@@ -193,16 +250,18 @@ class Coordinator:
                 yield f"[parse][directive] L{entry.line_no}: {entry.raw}"
             if parse_result.skip_reason:
                 yield f"[parse] SKIPPED: {parse_result.skip_reason}"
+            self._write_stub_run_artifacts(
+                artifacts_dir=artifacts_dir,
+                run_id=run_id,
+                run_started_at=run_started_at,
+                repo_url=repo_url_display,
+                repo_dir=repo_dir,
+                status="SKIPPED",
+                reason_code="directives_detected",
+                reason_detail=parse_result.skip_reason or "directive detected",
+            )
             yield "[run] COMPLETE: skipped"
             return
-
-        # Persist audit artifacts under a run-scoped directory.
-        artifacts_root = artifacts_root or os.path.join(os.getcwd(), "artifacts")
-        artifacts_root = os.path.abspath(artifacts_root)
-        os.makedirs(artifacts_root, exist_ok=True)
-        artifacts_dir = os.path.join(artifacts_root, run_id)
-        os.makedirs(artifacts_dir, exist_ok=True)
-        yield f"[artifacts] Directory: {artifacts_dir}"
 
         scan_ok = yield from self.run_pip_audit_stream(
             requirements_path=requirements_path,
@@ -309,12 +368,31 @@ class Coordinator:
                 else:
                     self.latest_cve_summary = "CVE summary: unavailable"
                     yield "[cve] FAILED: unable to write cve_status.json"
+                    # Ensure the CVE artifact exists even if the normal write failed.
+                    self._ensure_stub_cve_status(
+                        artifacts_dir=artifacts_dir,
+                        reason_code="cve_status_failed",
+                        reason_detail="unable to write cve_status.json",
+                    )
+            else:
+                self.latest_cve_summary = "CVE summary: unavailable"
+                # Backfill stub audit + CVE artifacts so downloads remain available.
+                self._ensure_stub_audit_artifacts(
+                    artifacts_dir=artifacts_dir,
+                    reason_code="final_audit_failed",
+                    reason_detail="final pip-audit failed",
+                )
+                self._ensure_stub_cve_status(
+                    artifacts_dir=artifacts_dir,
+                    reason_code="final_audit_failed",
+                    reason_detail="final pip-audit failed",
+                )
             summary_status = "SUCCESS" if scan_ok and final_ok else "FAILED"
             summary_ok, summary_path = self.write_summary(
                 artifacts_dir=artifacts_dir,
                 run_id=run_id,
                 run_started_at=run_started_at,
-                repo_url=repo_url,
+                repo_url=repo_url_value,
                 repo_dir=repo_dir,
                 status=summary_status,
                 before_count=before_count,
@@ -330,12 +408,158 @@ class Coordinator:
         else:
             # Clear any previous worklist if the scan failed.
             self.latest_worklist = []
+            self.latest_cve_summary = "CVE summary: unavailable"
+            # Write stub artifacts + summary to keep outputs consistent for failed runs.
+            self._write_stub_run_artifacts(
+                artifacts_dir=artifacts_dir,
+                run_id=run_id,
+                run_started_at=run_started_at,
+                repo_url=repo_url_display,
+                repo_dir=repo_dir,
+                status="FAILED",
+                reason_code="baseline_audit_failed",
+                reason_detail="baseline pip-audit failed",
+            )
         status = "success" if scan_ok and final_ok else "failed"
         yield f"[run] COMPLETE: {status}"
 
     @staticmethod
     def _new_run_id() -> str:
         return f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+    def _init_artifacts_dir(self, artifacts_root: Optional[str], run_id: str) -> str:
+        """Create (or reuse) the run-scoped artifacts directory."""
+        # Normalize and create the artifacts directory once per run.
+        artifacts_root = artifacts_root or os.path.join(os.getcwd(), "artifacts")
+        artifacts_root = os.path.abspath(artifacts_root)
+        os.makedirs(artifacts_root, exist_ok=True)
+        artifacts_dir = os.path.join(artifacts_root, run_id)
+        os.makedirs(artifacts_dir, exist_ok=True)
+        # Cache for the UI so download widgets can locate artifacts.
+        self.latest_artifacts_dir = artifacts_dir
+        return artifacts_dir
+
+    @staticmethod
+    def _write_json_file(path: str, payload: object) -> bool:
+        """Write JSON to disk with stable formatting."""
+        try:
+            # Keep formatting stable so artifacts diff cleanly between runs.
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _stub_audit_payload(reason_code: str, reason_detail: str) -> dict[str, object]:
+        """Build the stub payload for skipped/failed pip-audit artifacts."""
+        # Match the planned stub schema so downstream consumers can detect skip states.
+        return {
+            "skipped": True,
+            "reason_code": reason_code,
+            "reason_detail": reason_detail,
+            "results": [],
+        }
+
+    @staticmethod
+    def _stub_cve_payload(reason_code: str, reason_detail: str) -> dict[str, object]:
+        """Build the stub payload for skipped/failed CVE status artifacts."""
+        return {
+            "skipped": True,
+            "reason_code": reason_code,
+            "reason_detail": reason_detail,
+            "before": [],
+            "after": [],
+            "fixed": [],
+            "remaining": [],
+        }
+
+    def _ensure_stub_audit_artifacts(
+        self,
+        artifacts_dir: str,
+        reason_code: str,
+        reason_detail: str,
+    ) -> dict[str, str]:
+        """Ensure baseline/final audit artifacts exist, writing stubs if needed."""
+        # Create minimal JSON outputs if the audits failed or were skipped.
+        payload = self._stub_audit_payload(reason_code, reason_detail)
+        before_path = os.path.join(artifacts_dir, "pip_audit_before.json")
+        after_path = os.path.join(artifacts_dir, "pip_audit_after.json")
+        alias_path = os.path.join(artifacts_dir, "pip_audit.json")
+
+        if not os.path.isfile(before_path):
+            self._write_json_file(before_path, payload)
+        if not os.path.isfile(after_path):
+            self._write_json_file(after_path, payload)
+        if not os.path.isfile(alias_path):
+            if os.path.isfile(after_path):
+                try:
+                    shutil.copyfile(after_path, alias_path)
+                except OSError:
+                    self._write_json_file(alias_path, payload)
+            else:
+                # Fall back to a stub alias if the after artifact never materialized.
+                self._write_json_file(alias_path, payload)
+
+        return {"before": before_path, "after": after_path, "alias": alias_path}
+
+    def _ensure_stub_cve_status(
+        self,
+        artifacts_dir: str,
+        reason_code: str,
+        reason_detail: str,
+    ) -> str:
+        """Ensure cve_status.json exists, writing a stub if needed."""
+        # Avoid clobbering a real CVE status file if it was already written.
+        cve_path = os.path.join(artifacts_dir, "cve_status.json")
+        if os.path.isfile(cve_path):
+            return cve_path
+        payload = self._stub_cve_payload(reason_code, reason_detail)
+        self._write_json_file(cve_path, payload)
+        return cve_path
+
+    def _write_stub_run_artifacts(
+        self,
+        artifacts_dir: str,
+        run_id: str,
+        run_started_at: str,
+        repo_url: str,
+        repo_dir: str,
+        status: str,
+        reason_code: str,
+        reason_detail: str,
+    ) -> None:
+        """Write stub artifacts + summary for skipped/failed runs."""
+        # Backfill all required artifacts so the UI can always offer downloads.
+        self._ensure_stub_audit_artifacts(
+            artifacts_dir=artifacts_dir,
+            reason_code=reason_code,
+            reason_detail=reason_detail,
+        )
+        self._ensure_stub_cve_status(
+            artifacts_dir=artifacts_dir,
+            reason_code=reason_code,
+            reason_detail=reason_detail,
+        )
+        summary_ok, summary_path = self.write_summary(
+            artifacts_dir=artifacts_dir,
+            run_id=run_id,
+            run_started_at=run_started_at,
+            repo_url=repo_url,
+            repo_dir=repo_dir,
+            status=status,
+            before_count=None,
+            after_count=None,
+            worklist=[],
+            venv_dir=None,
+        )
+        if summary_ok:
+            # Cache the summary for the UI when we generate a stubbed run.
+            self.latest_summary = self._read_text_file(summary_path)
+        self.latest_cve_summary = (
+            "CVE summary: skipped" if status.upper() == "SKIPPED" else "CVE summary: unavailable"
+        )
 
     @staticmethod
     def _drain_events(
