@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -225,9 +226,31 @@ class Coordinator:
                     artifacts_dir=artifacts_dir,
                     workspace_dir=workspace_dir,
                 )
-                if patch_notes:
+                if patch_notes is not None:
+                    # Spot-check the fix by re-running pip-audit and updating patch notes.
+                    before_audit_path = os.path.join(artifacts_dir, "pip_audit_before.json")
+                    backup_path = os.path.join(
+                        os.path.dirname(requirements_path),
+                        "requirements_before.txt",
+                    )
+                    status, before_count, after_count, reverted = self._spot_check_fix(
+                        package_name=target.name,
+                        requirements_path=requirements_path,
+                        backup_path=backup_path,
+                        artifacts_dir=artifacts_dir,
+                        workspace_dir=workspace_dir,
+                        patch_notes_path=patch_path,
+                        before_audit_path=before_audit_path,
+                    )
+                    before_display = "unknown" if before_count is None else str(before_count)
+                    after_display = "unknown" if after_count is None else str(after_count)
+                    revert_note = " (reverted)" if reverted else ""
+                    yield (
+                        f"[verify] {target.name}: {status} "
+                        f"(before {before_display}, after {after_display}){revert_note}"
+                    )
                     # Cache patch notes for the UI to display the latest fix result.
-                    self.latest_patch_notes = patch_notes
+                    self.latest_patch_notes = self._read_text_file(patch_path)
                     yield f"[fix] Patch notes saved: {patch_path}"
                 else:
                     self.latest_patch_notes = ""
@@ -649,6 +672,233 @@ class Coordinator:
         else:
             yield f"[scan] Vulnerabilities found: {vuln_count}"
         return True
+
+    @staticmethod
+    def _read_text_file(path: str) -> str:
+        """Read a text file, returning empty string on failure."""
+        # Small helper so UI logging can reuse file contents without raising.
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return handle.read()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _read_json_file(path: str) -> Optional[object]:
+        """Read JSON from disk, returning None on failure."""
+        # Best-effort loader for baseline/spot-check artifacts.
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _files_differ(path_a: str, path_b: str) -> Optional[bool]:
+        """Return True if file contents differ, False if same, None if unreadable."""
+        # Avoid spot-check work if the fixer did not change requirements.txt.
+        try:
+            with open(path_a, "r", encoding="utf-8") as handle:
+                content_a = handle.read()
+            with open(path_b, "r", encoding="utf-8") as handle:
+                content_b = handle.read()
+        except OSError:
+            return None
+        return content_a != content_b
+
+    def _run_pip_audit_json(
+        self,
+        venv_dir: str,
+        requirements_path: str,
+    ) -> tuple[Optional[str], list[str]]:
+        """Run pip-audit and return JSON output + any stderr notes."""
+        # Reuse the existing venv so spot-checks stay fast and isolated.
+        venv_python = self._venv_python(venv_dir)
+        audit_cmd = [
+            venv_python,
+            "-m",
+            "pip_audit",
+            "-r",
+            requirements_path,
+            "--format",
+            "json",
+        ]
+        audit_result = self._run_command(audit_cmd, cwd=os.path.dirname(requirements_path))
+        notes: list[str] = []
+        if audit_result.returncode != 0:
+            notes.append(f"pip-audit exit code: {audit_result.returncode}")
+        if audit_result.stderr.strip():
+            notes.append(audit_result.stderr.strip())
+        if not audit_result.stdout.strip():
+            return None, notes
+        return audit_result.stdout, notes
+
+    def _count_package_vulns(self, payload: object, package_name: str) -> Optional[int]:
+        """Count vulnerabilities for a specific package name."""
+        # Compare only the target package so other dependency changes do not skew results.
+        normalized_target = self._normalize_name(package_name)
+        items = self._extract_audit_items(payload)
+        if not items:
+            return None
+        total = 0
+        found = False
+        for item in items:
+            name = item.get("name") or item.get("package") or item.get("dependency")
+            if not name:
+                continue
+            if self._normalize_name(str(name)) != normalized_target:
+                continue
+            found = True
+            vulns = item.get("vulns")
+            if vulns is None:
+                vulns = item.get("vulnerabilities")
+            if isinstance(vulns, list):
+                total += len(vulns)
+        if not found:
+            return 0
+        return total
+
+    @staticmethod
+    def _revert_requirements(backup_path: str, requirements_path: str) -> bool:
+        """Restore requirements.txt from the backup file."""
+        # Roll back a change if the spot-check indicates regressions.
+        if not os.path.isfile(backup_path):
+            return False
+        try:
+            shutil.copyfile(backup_path, requirements_path)
+        except OSError:
+            return False
+        return True
+
+    def _append_verification_notes(
+        self,
+        patch_notes_path: str,
+        status: str,
+        before_count: Optional[int],
+        after_count: Optional[int],
+        reverted: bool,
+        notes: list[str],
+    ) -> None:
+        """Append verification results to the patch notes file."""
+        # Keep fixer notes intact and append a verification section.
+        before_display = "unknown" if before_count is None else str(before_count)
+        after_display = "unknown" if after_count is None else str(after_count)
+        extra_notes = "; ".join(note for note in notes if note)
+        lines = [
+            "",
+            "Verification",
+            f"- status: {status}",
+            f"- before: {before_display}",
+            f"- after: {after_display}",
+            f"- reverted: {'yes' if reverted else 'no'}",
+        ]
+        if extra_notes:
+            lines.append(f"- notes: {extra_notes}")
+        try:
+            with open(patch_notes_path, "a", encoding="utf-8") as handle:
+                handle.write("\n".join(lines))
+                handle.write("\n")
+        except OSError:
+            return
+
+    def _spot_check_fix(
+        self,
+        package_name: str,
+        requirements_path: str,
+        backup_path: str,
+        artifacts_dir: str,
+        workspace_dir: str,
+        patch_notes_path: str,
+        before_audit_path: str,
+    ) -> tuple[str, Optional[int], Optional[int], bool]:
+        """Re-run pip-audit and compare vulnerabilities for a single package."""
+        status = "verified: failed"
+        before_count: Optional[int] = None
+        after_count: Optional[int] = None
+        reverted = False
+        notes: list[str] = []
+
+        changed = self._files_differ(backup_path, requirements_path)
+        if changed is False:
+            # No change means nothing to verify.
+            notes.append("no edit applied; spot-check skipped")
+            self._append_verification_notes(
+                patch_notes_path,
+                status,
+                before_count,
+                after_count,
+                reverted,
+                notes,
+            )
+            return status, before_count, after_count, reverted
+
+        before_payload = self._read_json_file(before_audit_path)
+        if before_payload is None:
+            # Proceed even if baseline is missing, but note the gap.
+            notes.append("baseline audit missing or unreadable")
+        else:
+            before_count = self._count_package_vulns(before_payload, package_name)
+
+        venv_dir = os.path.join(workspace_dir, ".venv")
+        # Run a new audit against the edited requirements.
+        audit_json, audit_notes = self._run_pip_audit_json(venv_dir, requirements_path)
+        if audit_notes:
+            notes.append("; ".join(audit_notes))
+        if audit_json is None:
+            notes.append("pip-audit spot-check failed")
+            self._append_verification_notes(
+                patch_notes_path,
+                status,
+                before_count,
+                after_count,
+                reverted,
+                notes,
+            )
+            return status, before_count, after_count, reverted
+
+        # Persist spot-check output for debugging and later review.
+        spotcheck_name = f"pip_audit_spotcheck_{self._sanitize_filename(package_name)}.json"
+        spotcheck_path = os.path.join(artifacts_dir, spotcheck_name)
+        try:
+            with open(spotcheck_path, "w", encoding="utf-8") as handle:
+                handle.write(audit_json)
+        except OSError:
+            notes.append("unable to save spot-check audit artifact")
+
+        try:
+            after_payload = json.loads(audit_json)
+        except json.JSONDecodeError:
+            after_payload = None
+            notes.append("spot-check JSON parse failed")
+
+        if after_payload is not None:
+            after_count = self._count_package_vulns(after_payload, package_name)
+
+        if before_count is None or after_count is None:
+            notes.append("unable to compare vulnerability counts")
+        else:
+            # Decide success/failure based on the package-specific counts.
+            if after_count < before_count:
+                status = "verified: vuln removed"
+            elif after_count > before_count:
+                notes.append("vulnerability count increased")
+                reverted = self._revert_requirements(backup_path, requirements_path)
+                if reverted:
+                    notes.append("requirements.txt reverted to backup")
+                else:
+                    notes.append("failed to revert requirements.txt")
+            else:
+                notes.append("vulnerability count unchanged")
+
+        self._append_verification_notes(
+            patch_notes_path,
+            status,
+            before_count,
+            after_count,
+            reverted,
+            notes,
+        )
+        return status, before_count, after_count, reverted
 
     def _run_fixer_once(
         self,
