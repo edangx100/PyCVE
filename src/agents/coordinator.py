@@ -49,10 +49,12 @@ class Coordinator:
         self.latest_worklist: list[WorklistItem] = []
         self.latest_patch_notes: str = ""
         self.patch_notes_paths: list[str] = []
+        self.latest_cve_summary: str = "CVE summary: pending"
         register_fixer_agent()
 
     def clone_repo_stream(
         self,
+        # Required input for git clone; validated before any workspace work starts.
         repo_url: str,
         workspace_root: str,
         run_id: Optional[str] = None,
@@ -71,6 +73,7 @@ class Coordinator:
         repo_dir = os.path.join(workspace_dir, "repo")
         self.latest_patch_notes = ""
         self.patch_notes_paths = []
+        self.latest_cve_summary = "CVE summary: pending"
 
         # Each run gets an isolated workspace to keep artifacts and venvs separate.
         os.makedirs(workspace_dir, exist_ok=True)
@@ -276,6 +279,27 @@ class Coordinator:
                 artifacts_dir=artifacts_dir,
                 before_audit_path=audit_path,
             )
+            if final_ok:
+                # Build cve_status.json and surface fixed/remaining counts to the UI.
+                cve_path = os.path.join(artifacts_dir, "cve_status.json")
+                cve_ok, fixed_count, remaining_count = self.write_cve_status(
+                    before_audit_path=audit_path,
+                    after_audit_path=os.path.join(artifacts_dir, "pip_audit_after.json"),
+                    artifacts_dir=artifacts_dir,
+                )
+                if cve_ok:
+                    yield f"[cve] Saved artifact: {cve_path}"
+                    fixed_display = "unknown" if fixed_count is None else str(fixed_count)
+                    remaining_display = "unknown" if remaining_count is None else str(remaining_count)
+                    self.latest_cve_summary = (
+                        f"CVE summary: fixed {fixed_display}, remaining {remaining_display}"
+                    )
+                    yield (
+                        f"[cve] Fixed: {fixed_display} | Remaining: {remaining_display}"
+                    )
+                else:
+                    self.latest_cve_summary = "CVE summary: unavailable"
+                    yield "[cve] FAILED: unable to write cve_status.json"
         else:
             # Clear any previous worklist if the scan failed.
             self.latest_worklist = []
@@ -801,6 +825,136 @@ class Coordinator:
         except OSError:
             return None
         return None
+
+    def write_cve_status(
+        self,
+        before_audit_path: str,
+        after_audit_path: str,
+        artifacts_dir: str,
+    ) -> tuple[bool, Optional[int], Optional[int]]:
+        """Write cve_status.json and return fixed/remaining counts."""
+        # Load both audits so we can diff vulnerability records across runs.
+        before_payload = self._read_json_file(before_audit_path)
+        after_payload = self._read_json_file(after_audit_path)
+        if before_payload is None or after_payload is None:
+            return False, None, None
+
+        status_payload, fixed_count, remaining_count = self._build_cve_status_payload(
+            before_payload, after_payload
+        )
+        cve_path = os.path.join(artifacts_dir, "cve_status.json")
+        try:
+            # Persist a stable, human-readable artifact for downstream tooling.
+            with open(cve_path, "w", encoding="utf-8") as handle:
+                json.dump(status_payload, handle, indent=2)
+        except OSError:
+            return False, None, None
+        return True, fixed_count, remaining_count
+
+    def _build_cve_status_payload(
+        self,
+        before_payload: object,
+        after_payload: object,
+    ) -> tuple[dict[str, list[dict[str, object]]], int, int]:
+        """Build the before/after/fixed/remaining structure for cve_status.json."""
+        before_records = self._collect_vuln_records(before_payload)
+        after_records = self._collect_vuln_records(after_payload)
+
+        # Compare records by (package, advisory_id) so we can diff across runs.
+        after_keys = {self._vuln_record_key(record) for record in after_records}
+
+        fixed_records: list[dict[str, object]] = []
+        for record in before_records:
+            # If a before record no longer appears after, mark it as fixed.
+            if self._vuln_record_key(record) in after_keys:
+                continue
+            fixed_entry = dict(record)
+            fixed_entry["status"] = "fixed"
+            fixed_records.append(fixed_entry)
+
+        remaining_records: list[dict[str, object]] = []
+        for record in after_records:
+            # Everything still present after the fix loop is considered remaining.
+            remaining_entry = dict(record)
+            remaining_entry["status"] = "remaining"
+            remaining_records.append(remaining_entry)
+
+        payload = {
+            "before": before_records,
+            "after": after_records,
+            "fixed": fixed_records,
+            "remaining": remaining_records,
+        }
+        return payload, len(fixed_records), len(remaining_records)
+
+    def _collect_vuln_records(self, payload: object) -> list[dict[str, object]]:
+        """Extract vulnerability records from pip-audit JSON output."""
+        records: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+
+        for item in self._extract_audit_items(payload):
+            # Normalize package names and vuln fields across pip-audit output variants.
+            name = item.get("name") or item.get("package") or item.get("dependency")
+            if not name:
+                continue
+            package = str(name)
+            vulns = item.get("vulns")
+            if vulns is None:
+                vulns = item.get("vulnerabilities")
+            if not isinstance(vulns, list):
+                continue
+
+            for vuln in vulns:
+                if not isinstance(vuln, dict):
+                    continue
+                # Prefer advisory IDs, then fall back to aliases when needed.
+                advisory_id = vuln.get("id") or vuln.get("cve") or vuln.get("name")
+                advisory_id = str(advisory_id).strip() if advisory_id else ""
+                aliases = self._unique_strings(self._string_list(vuln.get("aliases")))
+                fix_versions = self._string_list(
+                    vuln.get("fix_versions") or vuln.get("fixed_versions")
+                )
+                fix_versions = self._unique_strings(fix_versions)
+
+                if not advisory_id and aliases:
+                    advisory_id = aliases[0]
+                if not advisory_id:
+                    advisory_id = "unknown"
+
+                cve_ids = [
+                    alias for alias in aliases if str(alias).upper().startswith("CVE-")
+                ]
+                if advisory_id.upper().startswith("CVE-"):
+                    cve_ids = self._unique_strings([advisory_id] + cve_ids)
+                else:
+                    cve_ids = self._unique_strings(cve_ids)
+
+                # Capture a compact per-vuln record for before/after diffs.
+                record = {
+                    "package": package,
+                    "advisory_id": advisory_id,
+                    "cve_ids": cve_ids,
+                }
+                if aliases:
+                    record["aliases"] = aliases
+                if fix_versions:
+                    record["fix_versions"] = fix_versions
+
+                # Drop duplicates so each advisory is reported once per package.
+                key = self._vuln_record_key(record)
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append(record)
+
+        return records
+
+    def _vuln_record_key(self, record: dict[str, object]) -> tuple[str, str]:
+        """Build a stable key for comparing vulnerability records."""
+        # Use normalized package + advisory ID to avoid casing/alias drift.
+        package = str(record.get("package") or "")
+        advisory_id = str(record.get("advisory_id") or "")
+        return self._normalize_name(package), advisory_id
 
     def _write_fallback_patch_notes(
         self,

@@ -29,14 +29,17 @@ def start_scan(repo_url: str):
     # Keep the latest patch notes so the UI can show the most recent fix.
     patch_notes = ""
     progress_text = "<div style=\"font-size: 18px;\">Fix progress: pending</div>"
-    yield "\n".join(log_lines), table_rows, patch_notes, progress_text
+    cve_summary = "CVE summary: pending"
+    # Emit the initial UI state before any long-running work starts.
+    yield "\n".join(log_lines), table_rows, patch_notes, progress_text, cve_summary
 
     try:
         # Coordinator owns the OpenHands agent and clone workflow.
         coordinator = Coordinator()
     except Exception as exc:
         log_lines.append(f"[error] {exc}")
-        yield "\n".join(log_lines), table_rows, patch_notes, progress_text
+        # Surface initialization failures in the UI and stop streaming.
+        yield "\n".join(log_lines), table_rows, patch_notes, progress_text, cve_summary
         return
 
     # Run workspace directory on the host for now.
@@ -53,6 +56,8 @@ def start_scan(repo_url: str):
             table_rows = coordinator.worklist_table_rows()
             # Mirror the coordinator's cached patch notes into the UI.
             patch_notes = coordinator.latest_patch_notes
+            # Pull the latest CVE summary so the UI stays in sync with artifacts.
+            cve_summary = coordinator.latest_cve_summary or cve_summary
             progress_match = re.match(r"^\[fix\] Progress: (\d+)/(\d+) \(([^)]+)\)$", line)
             if progress_match:
                 current = int(progress_match.group(1))
@@ -61,10 +66,11 @@ def start_scan(repo_url: str):
                 progress_text = _format_progress(current, total, package)
             if line.startswith("[run] COMPLETE:"):
                 final_status = line
-            yield "\n".join(log_lines), table_rows, patch_notes, progress_text
+            # Stream the latest log/table/notes/progress state to Gradio.
+            yield "\n".join(log_lines), table_rows, patch_notes, progress_text, cve_summary
     except Exception as exc:
         log_lines.append(f"[error] {exc}")
-        yield "\n".join(log_lines), table_rows, patch_notes, progress_text
+        yield "\n".join(log_lines), table_rows, patch_notes, progress_text, cve_summary
     finally:
         if final_status:
             print(final_status)
@@ -83,10 +89,11 @@ with gr.Blocks(title="PyCVE") as demo:
     )
     patch_notes = gr.Textbox(label="Patch Notes (Latest)", lines=12, interactive=False)
     progress_output = gr.HTML("<div style=\"font-size: 18px;\">Fix progress: pending</div>")
+    cve_summary = gr.Textbox(label="CVE Summary", lines=1, interactive=False)
     run_button.click(
         start_scan,
         inputs=repo_input,
-        outputs=[log_output, worklist_table, patch_notes, progress_output],
+        outputs=[log_output, worklist_table, patch_notes, progress_output, cve_summary],
     )
 
 

@@ -129,12 +129,12 @@ Each task below delivers a small, testable increment that you can interact with 
 ---
 
 ### ✅ Task 13: cve_status.json Generation
-- [ ] Create `cve_status.json` with structure:
+- [x] Create `cve_status.json` with structure:
   - `{ "before": [...], "after": [...], "fixed": [...], "remaining": [...] }`
-- [ ] Include CVE IDs, package names, fix status
-- [ ] Save to artifacts directory
-- [ ] Display summary in UI (X fixed, Y remaining)
-- [ ] **test**: Open JSON file, verify it accurately reflects changes
+- [x] Include CVE IDs, package names, fix status
+- [x] Save to artifacts directory
+- [x] Display summary in UI (X fixed, Y remaining)
+- [x] **test**: Open JSON file, verify it accurately reflects changes
 
 ---
 
