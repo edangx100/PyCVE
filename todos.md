@@ -77,11 +77,11 @@ Each task below delivers a small, testable increment that you can interact with 
 ---
 
 ### ✅ Task 8: Direct Dependency Worklist
-- [ ] Parse pip-audit JSON results
-- [ ] Filter to only direct dependencies (match against parsed requirements.txt)
-- [ ] Build worklist with: pkg name, current spec, vuln IDs, fix versions, editability
-- [ ] Display worklist table in UI (package, CVEs, current version, suggested fix)
-- [ ] **test**: Verify worklist shows only direct dependencies, not transitives
+- [x] Parse pip-audit JSON results
+- [x] Filter to only direct dependencies (match against parsed requirements.txt)
+- [x] Build worklist with: pkg name, current spec, vuln IDs, fix versions, editability
+- [x] Display worklist table in UI (package, CVEs, current version, suggested fix)
+- [x] **test**: Verify worklist shows only direct dependencies, not transitives
 
 ---
 

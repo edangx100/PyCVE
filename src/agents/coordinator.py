@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -39,6 +41,7 @@ class Coordinator:
                 ),
             ],
         )
+        self.latest_worklist: list[WorklistItem] = []
 
     def clone_repo_stream(
         self,
@@ -187,6 +190,22 @@ class Coordinator:
             workspace_dir=workspace_dir,
             artifacts_dir=artifacts_dir,
         )
+        if scan_ok:
+            # Build and emit the direct-dependency worklist based on the audit JSON.
+            audit_path = os.path.join(artifacts_dir, "pip_audit_before.json")
+            worklist = self.build_worklist_from_audit(audit_path, parse_result)
+            self.latest_worklist = worklist
+            yield f"[worklist] Direct requirements: {len(parse_result.editable)}"
+            yield f"[worklist] Vulnerable direct packages: {len(worklist)}"
+            for item in worklist:
+                # Format a terse worklist line for streaming logs.
+                spec = item.spec or "(unpinned)"
+                vuln_ids = ", ".join(item.vuln_ids) if item.vuln_ids else "unknown"
+                fix_versions = ", ".join(item.fix_versions) if item.fix_versions else "unknown"
+                yield f"[worklist] {item.name} {spec} -> {vuln_ids} | fixes: {fix_versions}"
+        else:
+            # Clear any previous worklist if the scan failed.
+            self.latest_worklist = []
         status = "success" if scan_ok else "failed"
         yield f"[run] COMPLETE: {status}"
 
@@ -261,14 +280,14 @@ class Coordinator:
         cleaned = text.replace("\r", "\n")
         return [line.rstrip("\n") for line in cleaned.splitlines() if line.strip()]
 
-    def parse_requirements_file(self, path: str) -> "RequirementsParseResult":
+    def parse_requirements_file(self, path: str) -> RequirementsParseResult:
         """Read a requirements file and return parsed entries + directives."""
         # File wrapper for parse_requirements_text so callers can use a path.
         with open(path, "r", encoding="utf-8") as handle:
             return self.parse_requirements_text(handle.read())
 
     @staticmethod
-    def parse_requirements_text(text: str) -> "RequirementsParseResult":
+    def parse_requirements_text(text: str) -> RequirementsParseResult:
         """Parse editable requirements, flag directives, and keep unknown lines."""
         # Conservative parser: editable specs only, directive/unknown are gated.
         result = RequirementsParseResult()
@@ -327,7 +346,7 @@ class Coordinator:
     def _parse_editable_requirement(
         line: str,
         line_no: int,
-    ) -> Optional["RequirementEntry"]:
+    ) -> Optional[RequirementEntry]:
         """Parse simple PEP 440 name + optional version constraints."""
         # Accept only simple name[op]version constraints with comma-separated ops.
         name_re = r"[A-Za-z0-9][A-Za-z0-9._-]*"
@@ -396,6 +415,139 @@ class Coordinator:
             if isinstance(vulns, list):
                 total += len(vulns)
         return total
+
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        """Normalize package names for reliable comparisons."""
+        # PEP 503 normalization: lowercase and replace runs of -_. with a single dash.
+        return re.sub(r"[-_.]+", "-", name).lower()
+
+    @staticmethod
+    def _extract_audit_items(payload: object) -> list[dict]:
+        """Return a list of dependency dicts from pip-audit JSON output."""
+        # pip-audit may return a list or wrap dependencies in a dict; normalize to list[dict].
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            for key in ("dependencies", "results"):
+                if isinstance(payload.get(key), list):
+                    return [item for item in payload[key] if isinstance(item, dict)]
+            return [payload]
+        return []
+
+    @staticmethod
+    def _string_list(values: object) -> list[str]:
+        """Normalize an input into a list of strings."""
+        # Accept both singular strings and string lists; ignore other shapes.
+        if isinstance(values, list):
+            return [str(value) for value in values if value]
+        if isinstance(values, str):
+            return [values]
+        return []
+
+    def build_worklist_from_audit(
+        self,
+        audit_path: str,
+        parse_result: RequirementsParseResult,
+    ) -> list[WorklistItem]:
+        """Build a direct-dependency worklist from pip-audit JSON output."""
+        try:
+            with open(audit_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return []
+
+        # Map normalized direct requirement names for fast lookups.
+        direct_map = {
+            self._normalize_name(entry.name): entry for entry in parse_result.editable
+        }
+        worklist: list[WorklistItem] = []
+        seen: set[str] = set()
+
+        for item in self._extract_audit_items(payload):
+            name = item.get("name") or item.get("package") or item.get("dependency")
+            if not name:
+                continue
+            normalized = self._normalize_name(str(name))
+            # Only keep vulnerabilities tied to direct requirements.
+            if normalized not in direct_map:
+                continue
+            if normalized in seen:
+                continue
+
+            entry = direct_map[normalized]
+            vulns = item.get("vulns")
+            if vulns is None:
+                vulns = item.get("vulnerabilities")
+            # Skip clean dependencies so the worklist stays vulnerability-only.
+            if not isinstance(vulns, list) or not vulns:
+                continue
+            vuln_ids: list[str] = []
+            fix_versions: list[str] = []
+            for vuln in vulns:
+                if not isinstance(vuln, dict):
+                    continue
+                # Collect IDs and aliases for display, plus any fix versions.
+                vuln_id = vuln.get("id") or vuln.get("cve") or vuln.get("name")
+                if vuln_id:
+                    vuln_ids.append(str(vuln_id))
+                for alias in self._string_list(vuln.get("aliases")):
+                    vuln_ids.append(alias)
+                fixes = vuln.get("fix_versions")
+                if fixes is None:
+                    fixes = vuln.get("fixed_versions")
+                for fix in self._string_list(fixes):
+                    fix_versions.append(fix)
+
+            # Prefer the audited version, else fall back to the requirement spec.
+            current_version = str(item.get("version") or "").strip()
+            if not current_version:
+                current_version = entry.spec or "unknown"
+
+            worklist.append(
+                WorklistItem(
+                    name=entry.name,
+                    spec=entry.spec,
+                    current_version=current_version,
+                    vuln_ids=self._unique_strings(vuln_ids),
+                    fix_versions=self._unique_strings(fix_versions),
+                    is_editable=True,
+                    skip_reason=None,
+                )
+            )
+            seen.add(normalized)
+
+        return worklist
+
+    @staticmethod
+    def _unique_strings(items: list[str]) -> list[str]:
+        """Return a stable, de-duplicated list of strings."""
+        # Preserve original ordering while dropping repeats.
+        seen: set[str] = set()
+        unique: list[str] = []
+        for item in items:
+            if item in seen:
+                continue
+            seen.add(item)
+            unique.append(item)
+        return unique
+
+    def worklist_table_rows(self) -> list[list[str]]:
+        """Format the latest worklist into UI table rows."""
+        rows: list[list[str]] = []
+        for item in self.latest_worklist:
+            # Show the first suggested fix version as a quick hint.
+            vuln_ids = ", ".join(item.vuln_ids) if item.vuln_ids else "unknown"
+            suggested_fix = f">={item.fix_versions[0]}" if item.fix_versions else "unknown"
+            rows.append(
+                [
+                    item.name,
+                    vuln_ids,
+                    item.current_version,
+                    suggested_fix,
+                ]
+            )
+        return rows
 
     def run_pip_audit_stream(
         self,
@@ -483,4 +635,15 @@ class RequirementsParseResult:
     editable: list[RequirementEntry] = field(default_factory=list)
     directives: list[DirectiveEntry] = field(default_factory=list)
     unknown: list[DirectiveEntry] = field(default_factory=list)
+    skip_reason: Optional[str] = None
+
+
+@dataclass
+class WorklistItem:
+    name: str
+    spec: str
+    current_version: str
+    vuln_ids: list[str]
+    fix_versions: list[str]
+    is_editable: bool
     skip_reason: Optional[str] = None
