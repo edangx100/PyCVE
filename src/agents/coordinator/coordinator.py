@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import platform
+import posixpath
 import shlex
 import threading
 import time
@@ -23,7 +25,163 @@ from .models import (
     RunResult,
     WorklistItem,
 )
-from src.agents.fixer import FixerTask, register_fixer_agent
+from src.agents.fixer import FixerTask, create_fixer_agent, register_fixer_agent
+
+
+def _parse_bool_env(value: str, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _detect_platform() -> str:
+    machine = platform.machine().lower()
+    if "arm" in machine or "aarch64" in machine:
+        return "linux/arm64"
+    return "linux/amd64"
+
+
+def _candidate_host_ports(base_port: int, max_attempts: int = 5) -> list[int]:
+    ports = [base_port]
+    for offset in range(1, max_attempts):
+        ports.append(base_port + offset)
+    return ports
+
+
+def _is_port_unavailable_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        ("port" in message and "not available" in message)
+        or "address already in use" in message
+        or "port is already allocated" in message
+        or "failed to bind" in message
+    )
+
+
+def _load_docker_workspace_classes():
+    try:
+        from openhands.workspace import DockerDevWorkspace, DockerWorkspace
+
+        return DockerWorkspace, DockerDevWorkspace
+    except ImportError:
+        try:
+            from openhands.sdk.workspace import DockerDevWorkspace, DockerWorkspace
+
+            return DockerWorkspace, DockerDevWorkspace
+        except ImportError:
+            return None, None
+
+
+def _create_docker_workspace():
+    docker_workspace_cls, docker_dev_cls = _load_docker_workspace_classes()
+    if docker_workspace_cls is None:
+        raise RuntimeError(
+            "DockerWorkspace is unavailable; install a newer openhands-sdk that includes it."
+        )
+
+    extra_ports = _parse_bool_env(os.getenv("DOCKER_EXTRA_PORTS", "false"))
+    base_image = os.getenv("DOCKER_BASE_IMAGE", "python:3.11-slim")
+    server_image = os.getenv("DOCKER_SERVER_IMAGE", "").strip()
+    try:
+        host_port = int(os.getenv("DOCKER_HOST_PORT", "8010"))
+    except ValueError as exc:
+        raise RuntimeError("DOCKER_HOST_PORT must be an integer.") from exc
+    platform = _detect_platform()
+    workspace_root = os.getenv("DOCKER_WORKSPACE_ROOT", "/workspace")
+
+    attempts: list[dict[str, object]] = []
+    if server_image:
+        attempts.append(
+            {
+                "server_image": server_image,
+                "host_port": host_port,
+                "platform": platform,
+                "extra_ports": extra_ports,
+            }
+        )
+    attempts.append(
+            {
+                "server_image": "ghcr.io/openhands/agent-server:latest-python",
+                "platform": platform,
+                "extra_ports": extra_ports,
+            }
+        )
+    attempts.append(
+        {
+            "base_container_image": base_image,
+            "workspace_mount_path": workspace_root,
+            "extra_ports": extra_ports,
+            "host_port": host_port,
+        }
+    )
+    attempts.append({"base_container_image": base_image, "extra_ports": extra_ports})
+
+    last_exc: Optional[Exception] = None
+    for port in _candidate_host_ports(host_port):
+        port_blocked = False
+        for kwargs in attempts:
+            candidate = dict(kwargs)
+            if "host_port" in candidate:
+                candidate["host_port"] = port
+            try:
+                return docker_workspace_cls(**candidate)
+            except TypeError:
+                if "host_port" in candidate:
+                    candidate.pop("host_port", None)
+                try:
+                    return docker_workspace_cls(**candidate)
+                except Exception as exc:
+                    last_exc = exc
+                    if _is_port_unavailable_error(exc):
+                        port_blocked = True
+                        break
+                    continue
+            except Exception as exc:
+                last_exc = exc
+                if _is_port_unavailable_error(exc):
+                    port_blocked = True
+                    break
+                continue
+        if port_blocked:
+            continue
+
+    if docker_dev_cls is not None:
+        for port in _candidate_host_ports(host_port):
+            try:
+                return docker_dev_cls(
+                    base_image=base_image,
+                    host_port=port,
+                    platform=platform,
+                    extra_ports=extra_ports,
+                )
+            except TypeError:
+                try:
+                    return docker_dev_cls(base_image=base_image)
+                except Exception as exc:
+                    last_exc = exc
+                    if _is_port_unavailable_error(exc):
+                        continue
+                    break
+            except Exception as exc:
+                last_exc = exc
+                if _is_port_unavailable_error(exc):
+                    continue
+                break
+
+    if last_exc:
+        raise RuntimeError(
+            "Unable to initialize DockerWorkspace with available parameters. "
+            f"Last error: {last_exc}"
+        ) from last_exc
+    raise RuntimeError("Unable to initialize DockerWorkspace with available parameters.")
+
+
+def _container_paths(run_id: str) -> tuple[str, str, str, str]:
+    workspace_root = os.getenv("DOCKER_WORKSPACE_ROOT", "/workspace")
+    workspace_dir = posixpath.join(workspace_root, run_id)
+    repo_dir = posixpath.join(workspace_dir, "repo")
+    artifacts_dir = posixpath.join(workspace_dir, "artifacts")
+    return workspace_root, workspace_dir, repo_dir, artifacts_dir
 
 
 class Coordinator:
@@ -39,17 +197,7 @@ class Coordinator:
         model = model or os.getenv("COORDINATOR_OPENROUTER_MODEL", "openai/gpt-3.5-turbo")
         openrouter_model = f"openrouter/{model}"
         self.llm = LLM(model=openrouter_model, api_key=api_key)
-        self.agent = Agent(
-            llm=self.llm,
-            tools=[
-                # TerminalTool for git/pip-audit runs; DelegateTool to spawn the Fixer.
-                Tool(
-                    name=TerminalTool.name,
-                    params={"terminal_type": "subprocess"},
-                ),
-                Tool(name=DelegateTool.name),
-            ],
-        )
+        self.agent = self._build_agent(include_delegate=True)
         self.latest_worklist: list[WorklistItem] = []
         self.latest_patch_notes: str = ""
         self.patch_notes_paths: list[str] = []
@@ -58,6 +206,23 @@ class Coordinator:
         self.latest_summary_path: str = ""
         self.latest_artifacts_dir: str = ""
         register_fixer_agent()
+        # Local fixer agent for Docker runs when DelegateTool is unavailable.
+        self.fixer_agent = create_fixer_agent(self.llm)
+
+    def _build_agent(self, include_delegate: bool) -> Agent:
+        tools = [
+            # TerminalTool for git/pip-audit runs; DelegateTool to spawn the Fixer.
+            Tool(
+                name=TerminalTool.name,
+                params={"terminal_type": "subprocess"},
+            ),
+        ]
+        if include_delegate:
+            tools.append(Tool(name=DelegateTool.name))
+        return Agent(
+            llm=self.llm,
+            tools=tools,
+        )
 
     def clone_repo_stream(
         self,
@@ -73,9 +238,12 @@ class Coordinator:
         repo_url_display = repo_url_value or "unknown"
         run_id = run_id or self._new_run_id()
         run_started_at = time.strftime("%Y-%m-%d %H:%M:%S")
-        workspace_root = os.path.abspath(workspace_root)
-        workspace_dir = os.path.join(workspace_root, run_id)
-        repo_dir = os.path.join(workspace_dir, "repo")
+        (
+            workspace_root,
+            workspace_dir,
+            repo_dir,
+            container_artifacts_dir,
+        ) = _container_paths(run_id)
         # Reset per-run state so callers always see the latest artifacts.
         self.latest_patch_notes = ""
         self.patch_notes_paths = []
@@ -85,7 +253,6 @@ class Coordinator:
         self.latest_artifacts_dir = ""
 
         # Each run gets an isolated workspace to keep artifacts and venvs separate.
-        os.makedirs(workspace_dir, exist_ok=True)
         artifacts_dir = artifacts.init_artifacts_dir(artifacts_root, run_id)
         self.latest_artifacts_dir = artifacts_dir
         context = RunContext(
@@ -114,10 +281,85 @@ class Coordinator:
             yield "[run] COMPLETE: failed"
             return
 
+        try:
+            workspace = _create_docker_workspace()
+        except RuntimeError as exc:
+            yield f"[clone] FAILED: {exc}"
+            self._write_stub_run_artifacts(
+                context=context,
+                status="FAILED",
+                reason_code="docker_workspace_unavailable",
+                reason_detail=str(exc),
+            )
+            yield "[run] COMPLETE: failed"
+            return
+
+        try:
+            delegate_enabled = _parse_bool_env(
+                os.getenv("DOCKER_ENABLE_DELEGATE", "false")
+            )
+            docker_agent = self._build_agent(include_delegate=delegate_enabled)
+            with workspace:
+                yield from self._run_in_workspace(
+                    workspace=workspace,
+                    agent=docker_agent,
+                    fixer_agent=self.fixer_agent,
+                    delegate_enabled=delegate_enabled,
+                    repo_url_value=repo_url_value,
+                    context=context,
+                    workspace_dir=workspace_dir,
+                    repo_dir=repo_dir,
+                    container_artifacts_dir=container_artifacts_dir,
+                    artifacts_dir=artifacts_dir,
+                )
+        except Exception as exc:
+            yield f"[clone] FAILED: {exc}"
+            self._write_stub_run_artifacts(
+                context=context,
+                status="FAILED",
+                reason_code="workspace_run_failed",
+                reason_detail=str(exc),
+            )
+            yield "[run] COMPLETE: failed"
+        return
+
+    def _run_in_workspace(
+        self,
+        *,
+        workspace: object,
+        agent: Agent,
+        fixer_agent: Agent,
+        delegate_enabled: bool,
+        repo_url_value: str,
+        context: RunContext,
+        workspace_dir: str,
+        repo_dir: str,
+        container_artifacts_dir: str,
+        artifacts_dir: str,
+    ) -> Generator[str, None, None]:
+        init_cmd = (
+            f"mkdir -p {shlex.quote(workspace_dir)} "
+            f"{shlex.quote(container_artifacts_dir)}"
+        )
+        init_result = workspace.execute_command(init_cmd)
+        if init_result.exit_code != 0:
+            yield "[clone] FAILED: unable to initialize workspace directory."
+            if init_result.stderr:
+                yield f"[clone][error] {init_result.stderr.strip()}"
+            self._write_stub_run_artifacts(
+                context=context,
+                status="FAILED",
+                reason_code="workspace_init_failed",
+                reason_detail=init_result.stderr.strip() or "workspace init failed",
+            )
+            yield "[run] COMPLETE: failed"
+            return
+
         # Ask the agent to run the clone command in the workspace directory.
-        conversation = Conversation(agent=self.agent, workspace=workspace_dir)
+        conversation = Conversation(agent=agent, workspace=workspace)
         safe_url = shlex.quote(repo_url_value)
-        clone_cmd = f"git clone --progress {safe_url} repo"
+        safe_repo_dir = shlex.quote(repo_dir)
+        clone_cmd = f"git clone --progress {safe_url} {safe_repo_dir}"
         task = (
             "You are the Coordinator agent. Use TerminalTool to clone the repo. "
             f"Run exactly this command: {clone_cmd}. "
@@ -136,22 +378,6 @@ class Coordinator:
                 conversation.run()
             except Exception as exc:
                 run_errors.append(exc)
-
-        """
-        Main thread                         Background thread
-        -----------                         -----------------
-        conversation.send_message(task)        |
-        runner = Thread(target=_run)           |
-        runner.start()    -------------------->|  _run() calls conversation.run()
-        while runner.is_alive():               |  (blocking: LLM I/O + TerminalTool)
-        _drain_events(conversation)            |  conversation.state.events <- events
-        yield lines to caller                  |  (terminal output, progress)
-        sleep(0.2)                             |
-                                               | runner finishes (conversation.run returns / errors)
-        runner.join()  (wait for completion) <-|
-        final _drain_events(conversation)      |
-        continue with post-run logic           |
-        """
 
         runner = threading.Thread(target=_run, daemon=True)
         runner.start()
@@ -198,7 +424,11 @@ class Coordinator:
             yield "[run] COMPLETE: failed"
             return
 
-        if os.path.isdir(os.path.join(repo_dir, ".git")):
+        repo_check = audit.run_command(
+            ["test", "-d", posixpath.join(repo_dir, ".git")],
+            workspace=workspace,
+        )
+        if repo_check.returncode == 0:
             yield f"[clone] SUCCESS: {repo_dir}"
         else:
             # Protect downstream steps from running on an incomplete checkout.
@@ -213,8 +443,12 @@ class Coordinator:
             return
 
         # Parse requirements.txt and gate on directives before later stages.
-        requirements_path = os.path.join(repo_dir, "requirements.txt")
-        if not os.path.isfile(requirements_path):
+        requirements_path = posixpath.join(repo_dir, "requirements.txt")
+        requirements_check = audit.run_command(
+            ["test", "-f", requirements_path],
+            workspace=workspace,
+        )
+        if requirements_check.returncode != 0:
             yield f"[parse] SKIPPED: requirements.txt not found at {requirements_path}"
             self._write_stub_run_artifacts(
                 context=context,
@@ -225,8 +459,20 @@ class Coordinator:
             yield "[run] COMPLETE: skipped"
             return
 
+        requirements_text = self._read_workspace_file(workspace, requirements_path)
+        if requirements_text is None:
+            yield f"[parse] FAILED: unable to read {requirements_path}"
+            self._write_stub_run_artifacts(
+                context=context,
+                status="FAILED",
+                reason_code="requirements_read_failed",
+                reason_detail="unable to read requirements.txt",
+            )
+            yield "[run] COMPLETE: failed"
+            return
+
         yield f"[parse] Found requirements.txt at {requirements_path}"
-        parse_result = requirements_parser.parse_requirements_file(requirements_path)
+        parse_result = requirements_parser.parse_requirements_text(requirements_text)
         if parse_result.editable:
             yield f"[parse] Editable requirements: {len(parse_result.editable)}"
             for entry in parse_result.editable:
@@ -260,6 +506,7 @@ class Coordinator:
             requirements_path=requirements_path,
             workspace_dir=workspace_dir,
             artifacts_dir=artifacts_dir,
+            workspace=workspace,
         )
         worklist: list[WorklistItem] = []
         before_count: Optional[int] = None
@@ -279,24 +526,34 @@ class Coordinator:
                 fix_versions = ", ".join(item.fix_versions) if item.fix_versions else "unknown"
                 yield f"[worklist] {item.name} {spec} -> {vuln_ids} | fixes: {fix_versions}"
             if worklist:
+                if delegate_enabled:
+                    yield "[fix] DelegateTool enabled for Docker runtime."
+                else:
+                    yield "[fix] DelegateTool disabled; running Fixer directly."
                 # Task 11: iterate through the full worklist and fix packages serially.
                 # Map normalized names to requirement entries so fixer prompts have line context.
                 entry_map = {
                     audit.normalize_name(entry.name): entry for entry in parse_result.editable
                 }
                 total = len(worklist)
+                fix_label = "Delegating" if delegate_enabled else "Fixing"
                 yield f"[fix] Starting fix loop: {total} package(s)"
                 for index, target in enumerate(worklist, start=1):
                     entry = entry_map.get(audit.normalize_name(target.name))
                     # Emit progress so the UI can render a package-level progress bar.
                     yield f"[fix] Progress: {index}/{total} ({target.name})"
-                    yield f"[fix] Delegating package: {target.name}"
+                    yield f"[fix] {fix_label} package: {target.name}"
                     patch_notes, patch_path = self._run_fixer_once(
                         item=target,
                         entry=entry,
                         requirements_path=requirements_path,
                         artifacts_dir=artifacts_dir,
                         workspace_dir=workspace_dir,
+                        workspace=workspace,
+                        coordinator_agent=agent,
+                        fixer_agent=fixer_agent,
+                        use_delegate=delegate_enabled,
+                        container_artifacts_dir=container_artifacts_dir,
                     )
                     if os.path.isfile(patch_path):
                         # Track patch note paths so downstream UI can list all artifacts.
@@ -307,8 +564,8 @@ class Coordinator:
                             artifacts_dir,
                             "pip_audit_before.json",
                         )
-                        backup_path = os.path.join(
-                            os.path.dirname(requirements_path),
+                        backup_path = posixpath.join(
+                            posixpath.dirname(requirements_path),
                             "requirements_before.txt",
                         )
                         status, before_count, after_count, reverted = reporting.spot_check_fix(
@@ -319,6 +576,7 @@ class Coordinator:
                             workspace_dir=workspace_dir,
                             patch_notes_path=patch_path,
                             before_audit_path=before_audit_path,
+                            workspace=workspace,
                         )
                         before_display = "unknown" if before_count is None else str(before_count)
                         after_display = "unknown" if after_count is None else str(after_count)
@@ -339,6 +597,7 @@ class Coordinator:
                 workspace_dir=workspace_dir,
                 artifacts_dir=artifacts_dir,
                 before_audit_path=audit_path,
+                workspace=workspace,
             )
             if final_ok:
                 # Build cve_status.json and surface fixed/remaining counts to the UI.
@@ -386,9 +645,9 @@ class Coordinator:
                 before_count=before_count,
                 after_count=after_count,
                 worklist=worklist,
-                venv_dir=os.path.join(workspace_dir, ".venv"),
+                venv_dir=posixpath.join(workspace_dir, ".venv"),
             )
-            summary_text = reporting.build_summary_text(context, result)
+            summary_text = reporting.build_summary_text(context, result, workspace=workspace)
             summary_ok, summary_path = artifacts.write_summary(artifacts_dir, summary_text)
             if summary_ok:
                 self.latest_summary = summary_text
@@ -511,6 +770,26 @@ class Coordinator:
         cleaned = text.replace("\r", "\n")
         return [line.rstrip("\n") for line in cleaned.splitlines() if line.strip()]
 
+    @staticmethod
+    def _read_workspace_file(workspace: object, path: str) -> Optional[str]:
+        result = workspace.execute_command(f"cat {shlex.quote(path)}")
+        if result.exit_code != 0:
+            return None
+        return result.stdout
+
+    @staticmethod
+    def _download_workspace_file(
+        workspace: object,
+        source_path: str,
+        destination_path: str,
+    ) -> bool:
+        os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+        try:
+            result = workspace.file_download(source_path, destination_path)
+        except Exception:
+            return False
+        return bool(getattr(result, "success", False))
+
     def build_worklist_from_audit(
         self,
         audit_path: str,
@@ -607,17 +886,19 @@ class Coordinator:
         requirements_path: str,
         workspace_dir: str,
         artifacts_dir: str,
+        workspace: object,
     ) -> Generator[str, None, None]:
         """Install pip-audit into a venv, run it, and stream progress lines."""
         yield "[scan] Starting baseline pip-audit"
 
-        venv_dir = os.path.join(workspace_dir, ".venv")
-        if not os.path.isdir(venv_dir):
+        venv_dir = posixpath.join(workspace_dir, ".venv")
+        if not audit.workspace_dir_exists(workspace, venv_dir):
             yield f"[scan] Creating venv at {venv_dir}"
 
         baseline = audit.run_baseline_audit(
             requirements_path=requirements_path,
             workspace_dir=workspace_dir,
+            workspace=workspace,
         )
         if baseline.error:
             yield f"[scan] FAILED: {baseline.error}"
@@ -662,6 +943,7 @@ class Coordinator:
         workspace_dir: str,
         artifacts_dir: str,
         before_audit_path: str,
+        workspace: object,
     ) -> Generator[str, None, tuple[bool, Optional[int], Optional[int]]]:
         """Run a final pip-audit and write after/alias artifacts."""
         yield "[final] Starting final pip-audit"
@@ -669,6 +951,7 @@ class Coordinator:
         final = audit.run_final_audit(
             requirements_path=requirements_path,
             workspace_dir=workspace_dir,
+            workspace=workspace,
         )
         if final.venv_missing:
             yield "[final] FAILED: venv not found; cannot run final pip-audit"
@@ -717,12 +1000,21 @@ class Coordinator:
         requirements_path: str,
         artifacts_dir: str,
         workspace_dir: str,
+        workspace: object,
+        coordinator_agent: Agent,
+        fixer_agent: Agent,
+        use_delegate: bool,
+        container_artifacts_dir: str,
     ) -> tuple[Optional[str], str]:
         # Package up a single fix request with file paths and context.
         fix_version = item.fix_versions[0] if item.fix_versions else None
         patch_notes_name = f"PATCH_NOTES_{reporting.sanitize_filename(item.name)}.md"
+        container_patch_notes_path = posixpath.join(container_artifacts_dir, patch_notes_name)
         patch_notes_path = os.path.join(artifacts_dir, patch_notes_name)
-        backup_path = os.path.join(os.path.dirname(requirements_path), "requirements_before.txt")
+        backup_path = posixpath.join(
+            posixpath.dirname(requirements_path),
+            "requirements_before.txt",
+        )
         task = FixerTask(
             package=item.name,
             current_spec=item.spec,
@@ -730,31 +1022,49 @@ class Coordinator:
             fix_version=fix_version,
             requirements_path=requirements_path,
             requirements_before_path=backup_path,
-            patch_notes_path=patch_notes_path,
+            patch_notes_path=container_patch_notes_path,
             raw_line=entry.raw if entry else None,
             line_no=entry.line_no if entry else None,
         )
-        # Delegate the task to a Fixer sub-agent so only FileEditorTool is used.
-        conversation = Conversation(agent=self.agent, workspace=workspace_dir)
         fixer_prompt = task.prompt()
-        coordinator_prompt = (
-            "You are the Coordinator agent. Use DelegateTool to spawn a sub-agent "
-            "with id 'fixer' using agent type 'fixer'. "
-            "Delegate the following task to the fixer agent exactly.\n"
-            "BEGIN FIXER PROMPT\n"
-            f"{fixer_prompt}\n"
-            "END FIXER PROMPT"
-        )
-        conversation.send_message(coordinator_prompt)
+        if use_delegate:
+            # Delegate the task to a Fixer sub-agent so only FileEditorTool is used.
+            conversation = Conversation(agent=coordinator_agent, workspace=workspace)
+            coordinator_prompt = (
+                "You are the Coordinator agent. Use DelegateTool to spawn a sub-agent "
+                "with id 'fixer' using agent type 'fixer'. "
+                "Delegate the following task to the fixer agent exactly.\n"
+                "BEGIN FIXER PROMPT\n"
+                f"{fixer_prompt}\n"
+                "END FIXER PROMPT"
+            )
+            conversation.send_message(coordinator_prompt)
+        else:
+            conversation = Conversation(agent=fixer_agent, workspace=workspace)
+            conversation.send_message(fixer_prompt)
         conversation.run()
 
-        patch_notes = reporting.read_text_file(patch_notes_path)
+        patch_notes = ""
+        if self._download_workspace_file(
+            workspace,
+            container_patch_notes_path,
+            patch_notes_path,
+        ):
+            patch_notes = reporting.read_text_file(patch_notes_path)
         if not patch_notes.strip():
             # Create fallback patch notes so verification can append results.
+            local_backup_path = os.path.join(artifacts_dir, "requirements_before.txt")
+            local_requirements_path = os.path.join(artifacts_dir, "requirements_after.txt")
+            self._download_workspace_file(workspace, backup_path, local_backup_path)
+            self._download_workspace_file(
+                workspace,
+                requirements_path,
+                local_requirements_path,
+            )
             reporting.write_fallback_patch_notes(
                 item,
-                requirements_path,
-                backup_path,
+                local_requirements_path,
+                local_backup_path,
                 patch_notes_path,
             )
             patch_notes = reporting.read_text_file(patch_notes_path)

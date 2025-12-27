@@ -222,6 +222,7 @@ OpenHands SDK Docker reference: `https://docs.openhands.dev/sdk/guides/agent-ser
 
 **Implementation**
 
+Reference: https://docs.openhands.dev/sdk/guides/agent-server/docker-sandbox
 Use `DockerWorkspace` to set up the containerized environment:
 
 ```python

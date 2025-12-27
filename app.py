@@ -158,7 +158,7 @@ def start_scan(repo_url: str):
         )
         return
 
-    # Run workspace directory on the host for now.
+    # Keep host workspace root for compatibility; Docker uses /workspace in-container.
     workspace_root = os.path.join(os.getcwd(), "workspace")
     artifacts_root = os.path.join(os.getcwd(), "artifacts")
     final_status = None

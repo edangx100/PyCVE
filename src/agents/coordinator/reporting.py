@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import shutil
 import sys
@@ -47,27 +48,47 @@ def read_json_file(path: str) -> Optional[object]:
         return None
 
 
-def files_differ(path_a: str, path_b: str) -> Optional[bool]:
+def files_differ(
+    path_a: str,
+    path_b: str,
+    workspace: Optional[object] = None,
+) -> Optional[bool]:
     """Return True if file contents differ, False if same, None if unreadable."""
-    try:
-        with open(path_a, "r", encoding="utf-8") as handle:
-            content_a = handle.read()
-        with open(path_b, "r", encoding="utf-8") as handle:
-            content_b = handle.read()
-    except OSError:
-        return None
-    return content_a != content_b
+    if workspace is None:
+        try:
+            with open(path_a, "r", encoding="utf-8") as handle:
+                content_a = handle.read()
+            with open(path_b, "r", encoding="utf-8") as handle:
+                content_b = handle.read()
+        except OSError:
+            return None
+        return content_a != content_b
+
+    result = audit.run_command(["cmp", "-s", path_a, path_b], workspace=workspace)
+    if result.returncode == 0:
+        return False
+    if result.returncode == 1:
+        return True
+    return None
 
 
-def revert_requirements(backup_path: str, requirements_path: str) -> bool:
+def revert_requirements(
+    backup_path: str,
+    requirements_path: str,
+    workspace: Optional[object] = None,
+) -> bool:
     """Restore requirements.txt from the backup file."""
-    if not os.path.isfile(backup_path):
-        return False
-    try:
-        shutil.copyfile(backup_path, requirements_path)
-    except OSError:
-        return False
-    return True
+    if workspace is None:
+        if not os.path.isfile(backup_path):
+            return False
+        try:
+            shutil.copyfile(backup_path, requirements_path)
+        except OSError:
+            return False
+        return True
+
+    result = audit.run_command(["cp", backup_path, requirements_path], workspace=workspace)
+    return result.returncode == 0
 
 
 def append_verification_notes(
@@ -140,6 +161,7 @@ def spot_check_fix(
     workspace_dir: str,
     patch_notes_path: str,
     before_audit_path: str,
+    workspace: Optional[object] = None,
 ) -> tuple[str, Optional[int], Optional[int], bool]:
     """Re-run pip-audit and compare vulnerabilities for a single package."""
     status = "verified: failed"
@@ -148,7 +170,7 @@ def spot_check_fix(
     reverted = False
     notes: list[str] = []
 
-    changed = files_differ(backup_path, requirements_path)
+    changed = files_differ(backup_path, requirements_path, workspace=workspace)
     if changed is False:
         # No change means there's nothing to verify.
         notes.append("no edit applied; spot-check skipped")
@@ -169,9 +191,17 @@ def spot_check_fix(
         # Baseline count gives us the "before" vulnerability total for the package.
         before_count = audit.count_package_vulns(before_payload, package_name)
 
-    venv_dir = os.path.join(workspace_dir, ".venv")
+    venv_dir = (
+        posixpath.join(workspace_dir, ".venv")
+        if workspace is not None
+        else os.path.join(workspace_dir, ".venv")
+    )
     # Re-run pip-audit against the updated requirements.txt in the same venv.
-    audit_result = audit.run_pip_audit_json(venv_dir, requirements_path)
+    audit_result = audit.run_pip_audit_json(
+        venv_dir,
+        requirements_path,
+        workspace=workspace,
+    )
     audit_notes: list[str] = []
     if audit_result.returncode not in (None, 0):
         audit_notes.append(f"pip-audit exit code: {audit_result.returncode}")
@@ -214,7 +244,11 @@ def spot_check_fix(
             status = "verified: vuln removed"
         elif after_count > before_count:
             notes.append("vulnerability count increased")
-            reverted = revert_requirements(backup_path, requirements_path)
+            reverted = revert_requirements(
+                backup_path,
+                requirements_path,
+                workspace=workspace,
+            )
             if reverted:
                 notes.append("requirements.txt reverted to backup")
             else:
@@ -290,37 +324,85 @@ def build_summary_rows(
     return rows, fixed_count, skipped_count
 
 
-def collect_tool_versions(venv_dir: Optional[str]) -> dict[str, str]:
+def collect_tool_versions(
+    venv_dir: Optional[str],
+    workspace: Optional[object] = None,
+) -> dict[str, str]:
     """Collect tool version strings for the summary metadata."""
     versions: dict[str, str] = {}
-    if venv_dir and os.path.isdir(venv_dir):
+    venv_exists = False
+    if venv_dir:
+        if workspace is None:
+            venv_exists = os.path.isdir(venv_dir)
+        else:
+            venv_exists = audit.workspace_dir_exists(workspace, venv_dir)
+    if venv_dir and venv_exists:
         # Prefer the run's venv so versions match the audit environment.
-        venv_python = audit.venv_python(venv_dir)
-        versions["python"] = run_version_cmd([venv_python, "-V"]) or "unknown"
+        venv_python = audit.venv_python(venv_dir, force_posix=workspace is not None)
+        versions["python"] = (
+            run_version_cmd([venv_python, "-V"], workspace=workspace) or "unknown"
+        )
         versions["pip"] = (
-            run_version_cmd([venv_python, "-m", "pip", "--version"]) or "unknown"
+            run_version_cmd(
+                [venv_python, "-m", "pip", "--version"],
+                workspace=workspace,
+            )
+            or "unknown"
         )
         versions["pip_audit"] = (
-            run_version_cmd([venv_python, "-m", "pip_audit", "--version"]) or "unknown"
+            run_version_cmd(
+                [venv_python, "-m", "pip_audit", "--version"],
+                workspace=workspace,
+            )
+            or "unknown"
         )
     else:
-        versions["python"] = f"Python {sys.version.split()[0]}"
-        versions["pip"] = (
-            run_version_cmd([sys.executable, "-m", "pip", "--version"]) or "unknown"
-        )
-        versions["pip_audit"] = (
-            run_version_cmd([sys.executable, "-m", "pip_audit", "--version"]) or "unknown"
-        )
-    if shutil.which("uv"):
-        # Report uv only when present on PATH.
-        versions["uv"] = run_version_cmd(["uv", "--version"]) or "unknown"
+        if workspace is None:
+            versions["python"] = f"Python {sys.version.split()[0]}"
+            versions["pip"] = (
+                run_version_cmd([sys.executable, "-m", "pip", "--version"]) or "unknown"
+            )
+            versions["pip_audit"] = (
+                run_version_cmd([sys.executable, "-m", "pip_audit", "--version"]) or "unknown"
+            )
+        else:
+            python_bin = os.getenv("DOCKER_PYTHON_BIN", "python")
+            versions["python"] = (
+                run_version_cmd([python_bin, "-V"], workspace=workspace) or "unknown"
+            )
+            versions["pip"] = (
+                run_version_cmd(
+                    [python_bin, "-m", "pip", "--version"],
+                    workspace=workspace,
+                )
+                or "unknown"
+            )
+            versions["pip_audit"] = (
+                run_version_cmd(
+                    [python_bin, "-m", "pip_audit", "--version"],
+                    workspace=workspace,
+                )
+                or "unknown"
+            )
+    if workspace is None:
+        if shutil.which("uv"):
+            # Report uv only when present on PATH.
+            versions["uv"] = run_version_cmd(["uv", "--version"]) or "unknown"
+    else:
+        uv_version = run_version_cmd(["uv", "--version"], workspace=workspace)
+        if uv_version:
+            versions["uv"] = uv_version
     return versions
 
 
-def run_version_cmd(args: list[str], cwd: Optional[str] = None) -> Optional[str]:
+def run_version_cmd(
+    args: list[str],
+    cwd: Optional[str] = None,
+    workspace: Optional[object] = None,
+) -> Optional[str]:
     """Run a command and return the first non-empty output line."""
     try:
-        result = audit.run_command(args, cwd=cwd)
+        result = audit.run_command(args, cwd=cwd, workspace=workspace)
     except FileNotFoundError:
         return None
     # Prefer stdout, fall back to stderr for commands that print versions there.
@@ -330,10 +412,17 @@ def run_version_cmd(args: list[str], cwd: Optional[str] = None) -> Optional[str]
     return output.splitlines()[0].strip()
 
 
-def git_commit_hash(repo_dir: str) -> Optional[str]:
+def git_commit_hash(
+    repo_dir: str,
+    workspace: Optional[object] = None,
+) -> Optional[str]:
     """Return the git commit hash for the cloned repo."""
     try:
-        result = audit.run_command(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+        result = audit.run_command(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            workspace=workspace,
+        )
     except FileNotFoundError:
         return None
     if result.returncode != 0:
@@ -345,10 +434,11 @@ def git_commit_hash(repo_dir: str) -> Optional[str]:
 def build_summary_text(
     context: RunContext,
     result: RunResult,
+    workspace: Optional[object] = None,
 ) -> str:
     """Build the Markdown summary body for the run."""
-    commit_hash = git_commit_hash(context.repo_dir) or "unknown"
-    versions = collect_tool_versions(result.venv_dir)
+    commit_hash = git_commit_hash(context.repo_dir, workspace=workspace) or "unknown"
+    versions = collect_tool_versions(result.venv_dir, workspace=workspace)
     rows, fixed_count, skipped_count = build_summary_rows(
         worklist=result.worklist,
         artifacts_dir=context.artifacts_dir,
