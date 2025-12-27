@@ -1,0 +1,5 @@
+# Valid requirement so the parser sees an editable entry.
+requests==2.31.0
+
+# Intentional invalid line to make pip-audit exit with an error.
+this is not a valid requirement

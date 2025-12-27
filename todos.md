@@ -176,8 +176,8 @@ Each task below delivers a small, testable increment that you can interact with 
 - [x] Handle missing requirements.txt → write stub artifacts + SUMMARY
 - [x] Handle directive detection → SKIPPED status + stub artifacts
 - [x] Handle failed git clone → FAILED status + stub artifacts
-- [ ] Handle pip-audit failures → record in SUMMARY, continue gracefully
-- [ ] **test**: Test failure scenarios (bad URL, no requirements.txt), verify stubs generated
+- [x] Handle pip-audit failures → record in SUMMARY, continue gracefully
+- [x] **test**: Test failure scenarios (bad URL, no requirements.txt), verify stubs generated
 
 ---
 
