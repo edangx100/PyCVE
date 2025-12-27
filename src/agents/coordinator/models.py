@@ -57,3 +57,6 @@ class RunResult:
     summary_path: str = ""
     cve_summary: str = ""
     venv_dir: Optional[str] = None
+    # Optional skip/failure reason that gets surfaced in SUMMARY.md.
+    reason_code: Optional[str] = None
+    reason_detail: Optional[str] = None

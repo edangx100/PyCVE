@@ -556,6 +556,9 @@ class Coordinator:
             after_count=None,
             worklist=[],
             venv_dir=None,
+            # Preserve skip/failure reason so the SUMMARY can explain stub artifacts.
+            reason_code=reason_code,
+            reason_detail=reason_detail,
         )
         summary_text = reporting.build_summary_text(context, result)
         summary_path = artifacts.write_stub_run_artifacts(

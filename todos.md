@@ -173,7 +173,7 @@ Each task below delivers a small, testable increment that you can interact with 
 ---
 
 ### ✅ Task 17: Error Handling & Stub Artifacts
-- [ ] Handle missing requirements.txt → write stub artifacts + SUMMARY
+- [x] Handle missing requirements.txt → write stub artifacts + SUMMARY
 - [ ] Handle directive detection → SKIPPED status + stub artifacts
 - [ ] Handle failed git clone → FAILED status + stub artifacts
 - [ ] Handle pip-audit failures → record in SUMMARY, continue gracefully

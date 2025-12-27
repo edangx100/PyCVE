@@ -471,6 +471,15 @@ def build_summary_text(
             "",
             "## Status",
             f"- status: {result.status}",
+        ]
+    )
+    # Include skip/failure metadata so stub summaries explain why the run stopped.
+    if result.reason_code:
+        lines.append(f"- reason_code: {result.reason_code}")
+    if result.reason_detail:
+        lines.append(f"- reason_detail: {result.reason_detail}")
+    lines.extend(
+        [
             f"- vulnerabilities_before: {before_display}",
             f"- vulnerabilities_after: {after_display}",
             f"- packages_fixed: {fixed_count}",
