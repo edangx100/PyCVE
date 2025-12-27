@@ -104,6 +104,7 @@ class Coordinator:
             repo_dir = os.path.join(workspace_dir, "repo")
             container_artifacts_dir = os.path.join(workspace_dir, "artifacts")
         # Reset per-run state so callers always see the latest artifacts.
+        self.latest_worklist = []
         self.latest_patch_notes = ""
         self.patch_notes_paths = []
         self.latest_cve_summary = "CVE summary: pending"
