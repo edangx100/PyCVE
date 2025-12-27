@@ -256,6 +256,43 @@ RUN pip install --no-cache-dir pip-audit uv
 
 Use `DockerDevWorkspace` to auto-build from Dockerfile.
 
+**DelegateTool preload for Fixer workflow**
+
+**Why this is needed:** the agent-server registry only includes tools that are
+imported at startup. DelegateTool is not part of the default tool preset, so
+Docker runs that include DelegateTool will fail unless the server preloads it.
+
+Enable DelegateTool by preloading it inside the agent-server image, then let
+the Coordinator include it when `DOCKER_ENABLE_DELEGATE=true`.
+
+```
+Docker (custom agent-server, DelegateTool preloaded)
+----------------------------------------------------
+Coordinator Agent (remote)
+    |
+    | DelegateTool (registered on agent-server)
+    v
+Fixer Sub-Agent (FileEditorTool)
+    |
+    v
+Edits requirements.txt + writes PATCH_NOTES
+```
+
+Configuration relationship:
+
+```
+DOCKER_ENABLE_DELEGATE=true
+        |
+        v
+Coordinator includes DelegateTool in its tool list
+        |
+        v
+Agent-server image preloads DelegateTool
+        |
+        v
+Remote conversation can spawn Fixer sub-agent
+```
+
 **Trade-offs**
 
 * ✅ Strong isolation, reproducibility, security

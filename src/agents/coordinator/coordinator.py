@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import platform
 import posixpath
 import shlex
 import threading
@@ -25,163 +24,8 @@ from .models import (
     RunResult,
     WorklistItem,
 )
+from .docker_runtime import create_docker_workspace, docker_delegate_enabled, docker_paths
 from src.agents.fixer import FixerTask, create_fixer_agent, register_fixer_agent
-
-
-def _parse_bool_env(value: str, default: bool = False) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def _detect_platform() -> str:
-    machine = platform.machine().lower()
-    if "arm" in machine or "aarch64" in machine:
-        return "linux/arm64"
-    return "linux/amd64"
-
-
-def _candidate_host_ports(base_port: int, max_attempts: int = 5) -> list[int]:
-    ports = [base_port]
-    for offset in range(1, max_attempts):
-        ports.append(base_port + offset)
-    return ports
-
-
-def _is_port_unavailable_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return (
-        ("port" in message and "not available" in message)
-        or "address already in use" in message
-        or "port is already allocated" in message
-        or "failed to bind" in message
-    )
-
-
-def _load_docker_workspace_classes():
-    try:
-        from openhands.workspace import DockerDevWorkspace, DockerWorkspace
-
-        return DockerWorkspace, DockerDevWorkspace
-    except ImportError:
-        try:
-            from openhands.sdk.workspace import DockerDevWorkspace, DockerWorkspace
-
-            return DockerWorkspace, DockerDevWorkspace
-        except ImportError:
-            return None, None
-
-
-def _create_docker_workspace():
-    docker_workspace_cls, docker_dev_cls = _load_docker_workspace_classes()
-    if docker_workspace_cls is None:
-        raise RuntimeError(
-            "DockerWorkspace is unavailable; install a newer openhands-sdk that includes it."
-        )
-
-    extra_ports = _parse_bool_env(os.getenv("DOCKER_EXTRA_PORTS", "false"))
-    base_image = os.getenv("DOCKER_BASE_IMAGE", "python:3.11-slim")
-    server_image = os.getenv("DOCKER_SERVER_IMAGE", "").strip()
-    try:
-        host_port = int(os.getenv("DOCKER_HOST_PORT", "8010"))
-    except ValueError as exc:
-        raise RuntimeError("DOCKER_HOST_PORT must be an integer.") from exc
-    platform = _detect_platform()
-    workspace_root = os.getenv("DOCKER_WORKSPACE_ROOT", "/workspace")
-
-    attempts: list[dict[str, object]] = []
-    if server_image:
-        attempts.append(
-            {
-                "server_image": server_image,
-                "host_port": host_port,
-                "platform": platform,
-                "extra_ports": extra_ports,
-            }
-        )
-    attempts.append(
-            {
-                "server_image": "ghcr.io/openhands/agent-server:latest-python",
-                "platform": platform,
-                "extra_ports": extra_ports,
-            }
-        )
-    attempts.append(
-        {
-            "base_container_image": base_image,
-            "workspace_mount_path": workspace_root,
-            "extra_ports": extra_ports,
-            "host_port": host_port,
-        }
-    )
-    attempts.append({"base_container_image": base_image, "extra_ports": extra_ports})
-
-    last_exc: Optional[Exception] = None
-    for port in _candidate_host_ports(host_port):
-        port_blocked = False
-        for kwargs in attempts:
-            candidate = dict(kwargs)
-            if "host_port" in candidate:
-                candidate["host_port"] = port
-            try:
-                return docker_workspace_cls(**candidate)
-            except TypeError:
-                if "host_port" in candidate:
-                    candidate.pop("host_port", None)
-                try:
-                    return docker_workspace_cls(**candidate)
-                except Exception as exc:
-                    last_exc = exc
-                    if _is_port_unavailable_error(exc):
-                        port_blocked = True
-                        break
-                    continue
-            except Exception as exc:
-                last_exc = exc
-                if _is_port_unavailable_error(exc):
-                    port_blocked = True
-                    break
-                continue
-        if port_blocked:
-            continue
-
-    if docker_dev_cls is not None:
-        for port in _candidate_host_ports(host_port):
-            try:
-                return docker_dev_cls(
-                    base_image=base_image,
-                    host_port=port,
-                    platform=platform,
-                    extra_ports=extra_ports,
-                )
-            except TypeError:
-                try:
-                    return docker_dev_cls(base_image=base_image)
-                except Exception as exc:
-                    last_exc = exc
-                    if _is_port_unavailable_error(exc):
-                        continue
-                    break
-            except Exception as exc:
-                last_exc = exc
-                if _is_port_unavailable_error(exc):
-                    continue
-                break
-
-    if last_exc:
-        raise RuntimeError(
-            "Unable to initialize DockerWorkspace with available parameters. "
-            f"Last error: {last_exc}"
-        ) from last_exc
-    raise RuntimeError("Unable to initialize DockerWorkspace with available parameters.")
-
-
-def _container_paths(run_id: str) -> tuple[str, str, str, str]:
-    workspace_root = os.getenv("DOCKER_WORKSPACE_ROOT", "/workspace")
-    workspace_dir = posixpath.join(workspace_root, run_id)
-    repo_dir = posixpath.join(workspace_dir, "repo")
-    artifacts_dir = posixpath.join(workspace_dir, "artifacts")
-    return workspace_root, workspace_dir, repo_dir, artifacts_dir
 
 
 class Coordinator:
@@ -243,7 +87,7 @@ class Coordinator:
             workspace_dir,
             repo_dir,
             container_artifacts_dir,
-        ) = _container_paths(run_id)
+        ) = docker_paths(run_id)
         # Reset per-run state so callers always see the latest artifacts.
         self.latest_patch_notes = ""
         self.patch_notes_paths = []
@@ -282,7 +126,7 @@ class Coordinator:
             return
 
         try:
-            workspace = _create_docker_workspace()
+            workspace = create_docker_workspace()
         except RuntimeError as exc:
             yield f"[clone] FAILED: {exc}"
             self._write_stub_run_artifacts(
@@ -295,9 +139,7 @@ class Coordinator:
             return
 
         try:
-            delegate_enabled = _parse_bool_env(
-                os.getenv("DOCKER_ENABLE_DELEGATE", "false")
-            )
+            delegate_enabled = docker_delegate_enabled()
             docker_agent = self._build_agent(include_delegate=delegate_enabled)
             with workspace:
                 yield from self._run_in_workspace(
@@ -772,6 +614,7 @@ class Coordinator:
 
     @staticmethod
     def _read_workspace_file(workspace: object, path: str) -> Optional[str]:
+        # Read files inside the remote workspace via a simple cat command.
         result = workspace.execute_command(f"cat {shlex.quote(path)}")
         if result.exit_code != 0:
             return None
@@ -783,6 +626,7 @@ class Coordinator:
         source_path: str,
         destination_path: str,
     ) -> bool:
+        # Pull a file from the container to the host artifacts directory.
         os.makedirs(os.path.dirname(destination_path), exist_ok=True)
         try:
             result = workspace.file_download(source_path, destination_path)
@@ -895,6 +739,7 @@ class Coordinator:
         if not audit.workspace_dir_exists(workspace, venv_dir):
             yield f"[scan] Creating venv at {venv_dir}"
 
+        # Run pip-audit inside the container and capture JSON for artifacts.
         baseline = audit.run_baseline_audit(
             requirements_path=requirements_path,
             workspace_dir=workspace_dir,
@@ -920,6 +765,7 @@ class Coordinator:
             if note:
                 yield f"[scan][stderr] {note}"
 
+        # Persist the baseline audit JSON on the host for downstream steps.
         audit_ok, artifact_path = artifacts.write_audit_json(
             artifacts_dir=artifacts_dir,
             filename="pip_audit_before.json",
