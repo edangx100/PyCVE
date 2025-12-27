@@ -226,12 +226,11 @@ Reference: https://docs.openhands.dev/sdk/guides/agent-server/docker-sandbox
 Use `DockerWorkspace` to set up the containerized environment:
 
 ```python
-from openhands_sdk import DockerWorkspace
+from openhands.workspace import DockerWorkspace
 
 workspace = DockerWorkspace(
     base_container_image="python:3.11-slim",  # or custom image
     workspace_mount_path="/workspace",
-    extra_ports=False,  # set True for VS Code Web access (debugging)
 )
 
 # Agents run inside the container automatically
@@ -332,19 +331,22 @@ This keeps the demo robust while still being "reasonable" about comparability.
 
 ```bash
 # Docker configuration
+COORDINATOR_USE_DOCKER=true
 DOCKER_BASE_IMAGE=python:3.11-slim
-DOCKER_EXTRA_PORTS=false  # set "true" to enable VS Code Web on host_port+1
+DOCKER_SERVER_IMAGE=pycve-agent-server:delegate
+DOCKER_HOST_PORT=8010
+DOCKER_WORKSPACE_ROOT=/workspace
+DOCKER_ENABLE_DELEGATE=false
 ```
 
 **Runtime setup**
 
 ```python
 import os
-from openhands_sdk import DockerWorkspace
+from openhands.workspace import DockerWorkspace
 
 workspace = DockerWorkspace(
     base_container_image=os.getenv("DOCKER_BASE_IMAGE", "python:3.11-slim"),
-    extra_ports=os.getenv("DOCKER_EXTRA_PORTS", "false").lower() == "true",
 )
 ```
 

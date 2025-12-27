@@ -162,13 +162,13 @@ Each task below delivers a small, testable increment that you can interact with 
 ## Phase 6: Production Hardening
 
 ### ✅ Task 16: Docker Workspace Integration
-- [ ] Create `DockerWorkspace` configuration (per plan.md:226-238). Reference: https://docs.openhands.dev/sdk/guides/agent-server/docker-sandbox
-- [ ] Set `DOCKER_BASE_IMAGE` in .env
-- [ ] Update Coordinator to use Docker workspace instead of local
-- [ ] Verify repo clone, venv creation, pip-audit all work inside container
-- [ ] Workspace path: `/workspace/<run_id>/repo/` (container), artifacts on host
-- [ ] **test**: Run full scan, verify it works in Docker, artifacts appear on host
-- [ ] **test**: Run Docker scan with fixing enabled and verify PATCH_NOTES_*.md files are created
+- [x] Create `DockerWorkspace` configuration (per plan.md:226-238). Reference: https://docs.openhands.dev/sdk/guides/agent-server/docker-sandbox
+- [x] Set `DOCKER_BASE_IMAGE` in .env
+- [x] Update Coordinator to use Docker workspace instead of local
+- [x] Verify repo clone, venv creation, pip-audit all work inside container
+- [x] Workspace path: `/workspace/<run_id>/repo/` (container), artifacts on host
+- [x] **test**: Run full scan, verify it works in Docker, artifacts appear on host
+- [x] **test**: Run Docker scan with fixing enabled and verify PATCH_NOTES_*.md files are created
 
 ---
 

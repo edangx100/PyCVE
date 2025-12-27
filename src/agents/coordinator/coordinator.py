@@ -12,6 +12,7 @@ from typing import Generator, Optional
 
 from dotenv import load_dotenv
 from openhands.sdk import Agent, Conversation, LLM, Tool
+from openhands.sdk.workspace import LocalWorkspace
 from openhands.sdk.event import ObservationEvent
 from openhands.tools.delegate import DelegateTool
 from openhands.tools.terminal import TerminalTool
@@ -24,7 +25,12 @@ from .models import (
     RunResult,
     WorklistItem,
 )
-from .docker_runtime import create_docker_workspace, docker_delegate_enabled, docker_paths
+from .docker_runtime import (
+    coordinator_use_docker,
+    create_docker_workspace,
+    docker_delegate_enabled,
+    docker_paths,
+)
 from src.agents.fixer import FixerTask, create_fixer_agent, register_fixer_agent
 
 
@@ -82,12 +88,21 @@ class Coordinator:
         repo_url_display = repo_url_value or "unknown"
         run_id = run_id or self._new_run_id()
         run_started_at = time.strftime("%Y-%m-%d %H:%M:%S")
-        (
-            workspace_root,
-            workspace_dir,
-            repo_dir,
-            container_artifacts_dir,
-        ) = docker_paths(run_id)
+        # Decide whether this run uses Docker and derive the workspace paths.
+        use_docker = coordinator_use_docker()
+        if use_docker:
+            (
+                workspace_root,
+                workspace_dir,
+                repo_dir,
+                container_artifacts_dir,
+            ) = docker_paths(run_id)
+        else:
+            # Local runs mirror the Docker path layout under the local workspace root.
+            workspace_root = workspace_root or os.path.join(os.getcwd(), "workspace")
+            workspace_dir = os.path.join(workspace_root, run_id)
+            repo_dir = os.path.join(workspace_dir, "repo")
+            container_artifacts_dir = os.path.join(workspace_dir, "artifacts")
         # Reset per-run state so callers always see the latest artifacts.
         self.latest_patch_notes = ""
         self.patch_notes_paths = []
@@ -125,26 +140,38 @@ class Coordinator:
             yield "[run] COMPLETE: failed"
             return
 
-        try:
-            workspace = create_docker_workspace()
-        except RuntimeError as exc:
-            yield f"[clone] FAILED: {exc}"
-            self._write_stub_run_artifacts(
-                context=context,
-                status="FAILED",
-                reason_code="docker_workspace_unavailable",
-                reason_detail=str(exc),
-            )
-            yield "[run] COMPLETE: failed"
-            return
+        # Choose the workspace implementation based on COORDINATOR_USE_DOCKER.
+        if use_docker:
+            try:
+                # DockerWorkspace creation can fail if the SDK is too old or ports are busy.
+                workspace = create_docker_workspace()
+            except RuntimeError as exc:
+                yield f"[clone] FAILED: {exc}"
+                self._write_stub_run_artifacts(
+                    context=context,
+                    status="FAILED",
+                    reason_code="docker_workspace_unavailable",
+                    reason_detail=str(exc),
+                )
+                yield "[run] COMPLETE: failed"
+                return
+        else:
+            workspace = LocalWorkspace(working_dir=workspace_root)
 
         try:
-            delegate_enabled = docker_delegate_enabled()
-            docker_agent = self._build_agent(include_delegate=delegate_enabled)
+            # Docker runs can optionally disable DelegateTool if the server lacks it.
+            if use_docker:
+                # Only enable delegation when the Docker agent-server preloads DelegateTool.
+                delegate_enabled = docker_delegate_enabled()
+                active_agent = self._build_agent(include_delegate=delegate_enabled)
+            else:
+                # Local runs always use the prebuilt Coordinator agent with DelegateTool.
+                delegate_enabled = True
+                active_agent = self.agent
             with workspace:
                 yield from self._run_in_workspace(
                     workspace=workspace,
-                    agent=docker_agent,
+                    agent=active_agent,
                     fixer_agent=self.fixer_agent,
                     delegate_enabled=delegate_enabled,
                     repo_url_value=repo_url_value,

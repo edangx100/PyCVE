@@ -56,7 +56,6 @@ def create_docker_workspace():
             "DockerWorkspace is unavailable; install a newer openhands-sdk that includes it."
         )
 
-    extra_ports = _parse_bool_env(os.getenv("DOCKER_EXTRA_PORTS", "false"))
     base_image = os.getenv("DOCKER_BASE_IMAGE", "python:3.11-slim")
     server_image = os.getenv("DOCKER_SERVER_IMAGE", "").strip()
     try:
@@ -74,25 +73,23 @@ def create_docker_workspace():
                 "server_image": server_image,
                 "host_port": host_port,
                 "platform": docker_platform,
-                "extra_ports": extra_ports,
             }
         )
     attempts.append(
         {
             "server_image": "ghcr.io/openhands/agent-server:latest-python",
             "platform": docker_platform,
-            "extra_ports": extra_ports,
         }
     )
     attempts.append(
         {
             "base_container_image": base_image,
             "workspace_mount_path": workspace_root,
-            "extra_ports": extra_ports,
             "host_port": host_port,
         }
     )
-    attempts.append({"base_container_image": base_image, "extra_ports": extra_ports})
+    # Final fallback: minimal DockerWorkspace config using only the base image.
+    attempts.append({"base_container_image": base_image})
 
     last_exc: Optional[Exception] = None
     for port in _candidate_host_ports(host_port):
@@ -130,7 +127,6 @@ def create_docker_workspace():
                     base_image=base_image,
                     host_port=port,
                     platform=docker_platform,
-                    extra_ports=extra_ports,
                 )
             except TypeError:
                 try:
@@ -164,3 +160,8 @@ def docker_paths(run_id: str) -> tuple[str, str, str, str]:
 
 def docker_delegate_enabled() -> bool:
     return _parse_bool_env(os.getenv("DOCKER_ENABLE_DELEGATE", "false"))
+
+
+def coordinator_use_docker() -> bool:
+    # Default to Docker runs unless explicitly disabled.
+    return _parse_bool_env(os.getenv("COORDINATOR_USE_DOCKER", "true"), default=True)
